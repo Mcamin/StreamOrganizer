@@ -1,0 +1,13 @@
+services:
+  sync-watched:
+    build: .
+    container_name: sync-watched
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: Europe/Berlin
+      CRON_SCHEDULE: "0 */6 * * *"
+      RUN_ON_START: "false"
+    volumes:
+      - ./logs:/logs
