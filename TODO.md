@@ -16,6 +16,7 @@
 - verified tests in Docker-mounted development workflow
 - added Docker support with cron-based scheduled execution
 - added `Dockerfile`, `docker-compose.yml`, and container entrypoint
+- added Sonarr watched-tag to Jellyfin series played-state sync
 
 ## In Progress
 - none

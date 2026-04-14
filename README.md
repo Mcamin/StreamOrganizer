@@ -1,17 +1,18 @@
 # Sync Watched
 
-Sync watched movie state between Jellyfin and Radarr, and automatically move watched movies from a `New` root folder to a `Watched` root folder.
+Sync watched state between Jellyfin, Radarr, and Sonarr, and automatically move watched movies from a `New` root folder to a `Watched` root folder.
 
 ## Overview
-This project keeps Jellyfin and Radarr aligned for watched movies.
+This project keeps Jellyfin, Radarr, and Sonarr aligned for watched media.
 
 It can:
 1. read watched movies from Jellyfin
 2. apply a watched tag in Radarr
-3. mark Jellyfin items as watched when Radarr already has the watched tag
-4. move watched movies from one root folder to another in Radarr
-5. update Jellyfin paths after the move
-6. trigger a Jellyfin path-only refresh
+3. mark Jellyfin movies as watched when Radarr already has the watched tag
+4. mark Jellyfin series as watched when Sonarr already has the watched tag
+5. move watched movies from one root folder to another in Radarr
+6. update Jellyfin paths after the move
+7. trigger a Jellyfin path-only refresh
 
 ## Project files
 - `sync_watched.py`
@@ -41,10 +42,13 @@ Example values are provided in `.env.example`.
 Main settings:
 - `RADARR_URL`
 - `RADARR_API_KEY`
+- `SONARR_URL` optional, enables Jellyfin series sync from Sonarr watched tags
+- `SONARR_API_KEY` optional, required when `SONARR_URL` is set
 - `JELLYFIN_URL`
 - `JELLYFIN_API_KEY`
 - `JELLYFIN_USER_ID`
 - `WATCHED_TAG_ID`
+- `SONARR_WATCHED_TAG_ID` optional, defaults to `WATCHED_TAG_ID`
 - `NEW_ROOT_FOLDER`
 - `WATCHED_ROOT_FOLDER`
 - `LOG_LEVEL`
@@ -133,8 +137,8 @@ The script:
 The project has a pytest suite with strong coverage.
 
 Current status:
-- `46` tests passing
-- `99%` coverage
+- `55` tests passing locally
+- pytest suite now covers both movie sync and Sonarr series sync paths
 
 ## Security note
 Do not commit your real `.env` file.
@@ -150,6 +154,7 @@ Implemented:
 - automated tests
 - high coverage test suite
 - Dockerized scheduled runtime
+- Sonarr watched-tag to Jellyfin series played-state sync
 
 Still missing:
 - final publish-safe polish pass

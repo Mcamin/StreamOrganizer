@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-sync-watched.py — Sync watched status between Jellyfin and Radarr, then move files.
+sync-watched.py — Sync watched status between Jellyfin, Radarr, and Sonarr.
 
 Flow:
   1. Query Jellyfin for watched movies from Jellyfin
   2. Tag matching movies as watched in Radarr
   3. Mark Jellyfin items as watched when Radarr already has the watched tag
-  4. Move watched movies from the New root folder to the Watched root folder
-  5. Update Jellyfin paths for moved items
-  6. Trigger a Jellyfin path-only refresh
+  4. Mark Jellyfin series as watched when Sonarr already has the watched tag
+  5. Move watched movies from the New root folder to the Watched root folder
+  6. Update Jellyfin paths for moved items
+  7. Trigger a Jellyfin path-only refresh
 
 Usage:
   python3 sync-watched.py [--dry-run] [--skip-move] [--skip-scan]
@@ -41,13 +42,17 @@ def require_env(name: str) -> str:
 
 
 def load_config() -> dict[str, Any]:
+    watched_tag_id = int(os.environ.get("WATCHED_TAG_ID", "1"))
     return {
         "radarr_url": require_env("RADARR_URL"),
         "radarr_api_key": require_env("RADARR_API_KEY"),
+        "sonarr_url": os.environ.get("SONARR_URL", "").strip(),
+        "sonarr_api_key": os.environ.get("SONARR_API_KEY", "").strip(),
         "jellyfin_url": require_env("JELLYFIN_URL"),
         "jellyfin_api_key": require_env("JELLYFIN_API_KEY"),
         "jellyfin_user_id": require_env("JELLYFIN_USER_ID"),
-        "watched_tag_id": int(os.environ.get("WATCHED_TAG_ID", "1")),
+        "watched_tag_id": watched_tag_id,
+        "sonarr_watched_tag_id": int(os.environ.get("SONARR_WATCHED_TAG_ID", str(watched_tag_id))),
         "new_root_folder": os.environ.get("NEW_ROOT_FOLDER", "/movies/New"),
         "watched_root_folder": os.environ.get("WATCHED_ROOT_FOLDER", "/movies/Watched"),
         "log_level": os.environ.get("LOG_LEVEL", "INFO"),
@@ -165,6 +170,26 @@ def get_radarr_movies() -> dict[str, dict[str, Any]] | None:
             "tags": movie.get("tags", []),
             "qualityProfileId": movie.get("qualityProfileId", 1),
             "monitored": movie.get("monitored", True),
+        }
+    return result
+
+
+def get_sonarr_series() -> dict[str, dict[str, Any]] | None:
+    url = f"{CONFIG['sonarr_url']}/api/v3/series"
+    data = api_request(url, api_key=CONFIG["sonarr_api_key"])
+    if not isinstance(data, list):
+        return None
+
+    result: dict[str, dict[str, Any]] = {}
+    for series in data:
+        tvdb_id = series.get("tvdbId")
+        if not tvdb_id:
+            continue
+
+        result[str(tvdb_id)] = {
+            "id": series["id"],
+            "title": series["title"],
+            "tags": series.get("tags", []),
         }
     return result
 
@@ -315,34 +340,72 @@ def mark_jellyfin_unwatched_to_watched(radarr_watched_tmdb: set[str], dry_run: b
             logger.info("Marked '{}' as watched in Jellyfin", name)
 
 
+def mark_jellyfin_series_unwatched_to_watched(sonarr_watched_tvdb: set[str], dry_run: bool = False) -> None:
+    url = (
+        f"{CONFIG['jellyfin_url']}/Items?Recursive=true&IncludeItemTypes=Series"
+        f"&Fields=ProviderIds,UserData&api_key={CONFIG['jellyfin_api_key']}&Limit=500"
+    )
+    data = api_request(url, emby_token=CONFIG["jellyfin_api_key"])
+    if not isinstance(data, dict):
+        logger.error("Could not fetch Jellyfin series for watched sync")
+        return
+
+    to_mark: list[tuple[str, str]] = []
+    for item in data.get("Items", []):
+        providers = item.get("ProviderIds", {})
+        tvdb = providers.get("Tvdb")
+        played = item.get("UserData", {}).get("Played", False)
+        if tvdb and str(tvdb) in sonarr_watched_tvdb and not played:
+            to_mark.append((item["Id"], item["Name"]))
+
+    if not to_mark:
+        logger.info("All Jellyfin series already synced, nothing to mark")
+        return
+
+    for item_id, name in to_mark:
+        if dry_run:
+            logger.info("[DRY-RUN] Would mark '{}' as watched in Jellyfin", name)
+            continue
+
+        mark_url = (
+            f"{CONFIG['jellyfin_url']}/Users/{CONFIG['jellyfin_user_id']}/PlayedItems/{item_id}"
+            f"?api_key={CONFIG['jellyfin_api_key']}"
+        )
+        result = api_request(mark_url, method="POST", emby_token=CONFIG["jellyfin_api_key"])
+        if result is None:
+            logger.error("Failed to mark series '{}' as watched in Jellyfin", name)
+        else:
+            logger.info("Marked series '{}' as watched in Jellyfin", name)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Sync watched status between Jellyfin and Radarr")
+    parser = argparse.ArgumentParser(description="Sync watched status between Jellyfin, Radarr, and Sonarr")
     parser.add_argument("--dry-run", action="store_true", help="Show what would happen without making changes")
     parser.add_argument("--skip-move", action="store_true", help="Skip moving files (only tag)")
     parser.add_argument("--skip-scan", action="store_true", help="Skip Jellyfin library scan")
     args = parser.parse_args()
 
     logger.info("{}", "=" * 60)
-    logger.info("Watched Sync: Jellyfin <-> Radarr")
+    logger.info("Watched Sync: Jellyfin <-> Radarr (+ Sonarr if configured)")
     logger.info("{}", "=" * 60)
 
     global radarr_movies_cache
 
-    logger.info("[1/6] Fetching watched movies from Jellyfin...")
+    logger.info("[1/7] Fetching watched movies from Jellyfin...")
     jf_watched = get_jellyfin_watched()
     if jf_watched is None:
         logger.error("Failed to fetch watched movies from Jellyfin")
         sys.exit(1)
     logger.info("Found {} watched movies in Jellyfin", len(jf_watched))
 
-    logger.info("[2/6] Fetching movies from Radarr...")
+    logger.info("[2/7] Fetching movies from Radarr...")
     radarr_movies_cache = get_radarr_movies()
     if radarr_movies_cache is None:
         logger.error("Failed to fetch movies from Radarr")
         sys.exit(1)
     logger.info("Found {} movies in Radarr", len(radarr_movies_cache))
 
-    logger.info("[3/6] Syncing watched tag to Radarr...")
+    logger.info("[3/7] Syncing watched tag to Radarr...")
     to_tag: list[int] = []
     for tmdb in jf_watched:
         if tmdb in radarr_movies_cache:
@@ -357,13 +420,29 @@ def main() -> None:
     else:
         logger.info("All watched movies already tagged in Radarr")
 
-    logger.info("[3b/6] Checking Radarr watched -> Jellyfin...")
+    logger.info("[3b/7] Checking Radarr watched -> Jellyfin...")
     radarr_watched_tmdb = {
         tmdb for tmdb, movie in radarr_movies_cache.items() if CONFIG["watched_tag_id"] in movie["tags"]
     }
     mark_jellyfin_unwatched_to_watched(radarr_watched_tmdb, dry_run=args.dry_run)
 
-    logger.info("[4/6] Moving watched movies to Watched folder...")
+    logger.info("[4/7] Checking Sonarr watched -> Jellyfin series...")
+    if CONFIG["sonarr_url"] and CONFIG["sonarr_api_key"]:
+        sonarr_series = get_sonarr_series()
+        if sonarr_series is None:
+            logger.error("Failed to fetch series from Sonarr")
+        else:
+            sonarr_watched_tvdb = {
+                tvdb
+                for tvdb, series in sonarr_series.items()
+                if CONFIG["sonarr_watched_tag_id"] in series["tags"]
+            }
+            logger.info("Found {} Sonarr series tagged as watched", len(sonarr_watched_tvdb))
+            mark_jellyfin_series_unwatched_to_watched(sonarr_watched_tvdb, dry_run=args.dry_run)
+    else:
+        logger.info("Skipped, Sonarr sync is not configured")
+
+    logger.info("[5/7] Moving watched movies to Watched folder...")
     if args.skip_move:
         logger.info("Skipped (--skip-move)")
     else:
@@ -382,15 +461,15 @@ def main() -> None:
                 logger.info("Waiting {}s for Radarr to process moves...", CONFIG["move_wait_seconds"])
                 time.sleep(CONFIG["move_wait_seconds"])
 
-                logger.info("[4b/6] Updating Jellyfin paths for moved items...")
+                logger.info("[5b/7] Updating Jellyfin paths for moved items...")
                 update_jellyfin_paths(moved, dry_run=args.dry_run)
 
-                logger.info("[4c/6] Triggering Jellyfin path-only refresh...")
+                logger.info("[5c/7] Triggering Jellyfin path-only refresh...")
                 trigger_path_refresh(dry_run=args.dry_run)
         else:
             logger.info("All watched movies already in Watched folder")
 
-    logger.info("[5/6] Triggering Jellyfin library scan...")
+    logger.info("[6/7] Triggering Jellyfin library scan...")
     if args.skip_scan:
         logger.info("Skipped (--skip-scan). Relying on Radarr -> Jellyfin sync for played status.")
     elif args.dry_run:
@@ -398,7 +477,7 @@ def main() -> None:
     else:
         logger.info("Skipping Jellyfin library scan (due to potential unmark issue).")
 
-    logger.info("[6/6] Final verification: Jellyfin watched -> Radarr tag...")
+    logger.info("[7/7] Final verification: Jellyfin watched -> Radarr tag...")
     mark_jellyfin_unwatched_to_watched(set(jf_watched.keys()), dry_run=args.dry_run)
 
     logger.info("{}", "=" * 60)
