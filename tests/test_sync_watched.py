@@ -11,38 +11,65 @@ if str(PROJECT_ROOT) not in sys.path:
 
 @pytest.fixture
 def module(monkeypatch):
+    for key in [
+        "RADARR_URL",
+        "RADARR_API_KEY",
+        "SONARR_URL",
+        "SONARR_API_KEY",
+        "SONARR_WATCHED_TAG",
+        "JELLYFIN_URL",
+        "JELLYFIN_API_KEY",
+        "JELLYFIN_USERNAME",
+        "RADARR_WATCHED_TAG",
+        "MOVIE_NEW_ROOT_FOLDER",
+        "MOVIE_WATCHED_ROOT_FOLDER",
+        "SERIES_NEW_ROOT_FOLDER",
+        "SERIES_WATCHED_ROOT_FOLDER",
+        "LOG_LEVEL",
+        "LOG_FILE",
+        "REQUEST_TIMEOUT",
+        "REQUEST_RETRIES",
+        "REQUEST_RETRY_DELAY",
+        "JELLYFIN_LIMIT",
+        "JELLYFIN_PATH_UPDATES_ONLY",
+    ]:
+        monkeypatch.delenv(key, raising=False)
+
     monkeypatch.setenv("RADARR_URL", "https://radarr.example.com")
     monkeypatch.setenv("RADARR_API_KEY", "radarr-key")
     monkeypatch.setenv("JELLYFIN_URL", "https://jellyfin.example.com")
     monkeypatch.setenv("JELLYFIN_API_KEY", "jellyfin-key")
-    monkeypatch.setenv("JELLYFIN_USER_ID", "user-123")
-    monkeypatch.setenv("WATCHED_TAG_ID", "1")
-    monkeypatch.setenv("NEW_ROOT_FOLDER", "/movies/New")
-    monkeypatch.setenv("WATCHED_ROOT_FOLDER", "/movies/Watched")
+    monkeypatch.setenv("JELLYFIN_USERNAME", "testuser")
+    monkeypatch.setenv("RADARR_WATCHED_TAG", "watched")
+    monkeypatch.setenv("MOVIE_NEW_ROOT_FOLDER", "/movies/New")
+    monkeypatch.setenv("MOVIE_WATCHED_ROOT_FOLDER", "/movies/Watched")
+    monkeypatch.setenv("SERIES_NEW_ROOT_FOLDER", "/series/New")
+    monkeypatch.setenv("SERIES_WATCHED_ROOT_FOLDER", "/series/Watched")
     monkeypatch.setenv("LOG_LEVEL", "INFO")
-    monkeypatch.delenv("SONARR_URL", raising=False)
-    monkeypatch.delenv("SONARR_API_KEY", raising=False)
-    monkeypatch.delenv("SONARR_WATCHED_TAG_ID", raising=False)
-    monkeypatch.delenv("LOG_FILE", raising=False)
+    monkeypatch.setenv("REQUEST_TIMEOUT", "30")
+    monkeypatch.setenv("REQUEST_RETRIES", "2")
+    monkeypatch.setenv("REQUEST_RETRY_DELAY", "0")
+    monkeypatch.setenv("JELLYFIN_LIMIT", "1000")
+    monkeypatch.setenv("JELLYFIN_PATH_UPDATES_ONLY", "true")
 
     sys.modules.pop("sync_watched", None)
     import sync_watched as mod
     return mod
 
-
 def test_require_env_missing(monkeypatch, capsys):
-    monkeypatch.delenv("MISSING_VAR", raising=False)
-    if str(PROJECT_ROOT) not in sys.path:
-        sys.path.insert(0, str(PROJECT_ROOT))
     monkeypatch.setenv("RADARR_URL", "x")
     monkeypatch.setenv("RADARR_API_KEY", "x")
     monkeypatch.setenv("JELLYFIN_URL", "x")
     monkeypatch.setenv("JELLYFIN_API_KEY", "x")
-    monkeypatch.setenv("JELLYFIN_USER_ID", "x")
+    monkeypatch.setenv("JELLYFIN_USERNAME", "x")
+
     sys.modules.pop("sync_watched", None)
     import sync_watched as mod
+
+    monkeypatch.delenv("MISSING_VAR", raising=False)
     with pytest.raises(SystemExit):
         mod.require_env("MISSING_VAR")
+
     captured = capsys.readouterr()
     assert "Missing required environment variable" in captured.err
 
@@ -50,10 +77,14 @@ def test_require_env_missing(monkeypatch, capsys):
 def test_load_config(module):
     cfg = module.load_config()
     assert cfg["radarr_url"] == "https://radarr.example.com"
-    assert cfg["watched_tag_id"] == 1
+    assert cfg["radarr_api_key"] == "radarr-key"
+    assert cfg["jellyfin_url"] == "https://jellyfin.example.com"
+    assert cfg["jellyfin_username"] == "testuser"
+    assert cfg["radarr_watched_tag"] == "watched"
+    assert cfg["movie_new_root_folder"] == "/movies/New"
+    assert cfg["movie_watched_root_folder"] == "/movies/Watched"
     assert cfg["sonarr_url"] == ""
-    assert cfg["sonarr_watched_tag_id"] == 1
-    assert cfg["new_root_folder"] == "/movies/New"
+    assert cfg["jellyfin_path_updates_only"] is True
 
 
 def test_load_config_sonarr_override(monkeypatch):
@@ -61,17 +92,18 @@ def test_load_config_sonarr_override(monkeypatch):
     monkeypatch.setenv("RADARR_API_KEY", "radarr-key")
     monkeypatch.setenv("SONARR_URL", "https://sonarr.example.com")
     monkeypatch.setenv("SONARR_API_KEY", "sonarr-key")
-    monkeypatch.setenv("SONARR_WATCHED_TAG_ID", "9")
+    monkeypatch.setenv("SONARR_WATCHED_TAG", "watched-series")
     monkeypatch.setenv("JELLYFIN_URL", "https://jellyfin.example.com")
     monkeypatch.setenv("JELLYFIN_API_KEY", "jellyfin-key")
-    monkeypatch.setenv("JELLYFIN_USER_ID", "user-123")
-    monkeypatch.setenv("WATCHED_TAG_ID", "1")
+    monkeypatch.setenv("JELLYFIN_USERNAME", "testuser")
+
     sys.modules.pop("sync_watched", None)
     import sync_watched as mod
 
     cfg = mod.load_config()
     assert cfg["sonarr_url"] == "https://sonarr.example.com"
-    assert cfg["sonarr_watched_tag_id"] == 9
+    assert cfg["sonarr_api_key"] == "sonarr-key"
+    assert cfg["sonarr_watched_tag"] == "watched-series"
 
 
 def test_setup_logging_with_file(module, tmp_path):
@@ -84,10 +116,13 @@ def test_setup_logging_with_file(module, tmp_path):
 def test_api_request_json_response(module, monkeypatch):
     class FakeResponse:
         status = 200
+
         def read(self):
             return b'{"ok": true}'
+
         def __enter__(self):
             return self
+
         def __exit__(self, exc_type, exc, tb):
             return False
 
@@ -101,10 +136,13 @@ def test_api_request_with_headers_and_body(module, monkeypatch):
 
     class FakeResponse:
         status = 200
+
         def read(self):
             return b'{"ok": true}'
+
         def __enter__(self):
             return self
+
         def __exit__(self, exc_type, exc, tb):
             return False
 
@@ -121,6 +159,7 @@ def test_api_request_with_headers_and_body(module, monkeypatch):
         api_key="k1",
         emby_token="k2",
     )
+
     assert captured["headers"]["X-api-key"] == "k1"
     assert captured["headers"]["X-emby-token"] == "k2"
     assert captured["data"] is not None
@@ -129,10 +168,13 @@ def test_api_request_with_headers_and_body(module, monkeypatch):
 def test_api_request_empty_response(module, monkeypatch):
     class FakeResponse:
         status = 204
+
         def read(self):
             return b""
+
         def __enter__(self):
             return self
+
         def __exit__(self, exc_type, exc, tb):
             return False
 
@@ -141,27 +183,16 @@ def test_api_request_empty_response(module, monkeypatch):
     assert result == {"status": 204}
 
 
-def test_api_request_unexpected_status(module, monkeypatch):
-    class FakeResponse:
-        status = 201
-        def read(self):
-            return b"{}"
-        def __enter__(self):
-            return self
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    monkeypatch.setattr(module.urllib.request, "urlopen", lambda req, timeout=30: FakeResponse())
-    assert module.api_request("https://example.com") is None
-
-
 def test_api_request_non_json(module, monkeypatch):
     class FakeResponse:
         status = 200
+
         def read(self):
-            return b'not-json'
+            return b"not-json"
+
         def __enter__(self):
             return self
+
         def __exit__(self, exc_type, exc, tb):
             return False
 
@@ -175,22 +206,9 @@ def test_api_request_http_error(module, monkeypatch):
     class FakeHTTPError(module.urllib.error.HTTPError):
         def __init__(self):
             super().__init__("https://x", 500, "boom", hdrs=None, fp=None)
+
         def read(self):
             return b"server error"
-
-    def raise_error(req, timeout=30):
-        raise FakeHTTPError()
-
-    monkeypatch.setattr(module.urllib.request, "urlopen", raise_error)
-    assert module.api_request("https://example.com") is None
-
-
-def test_api_request_http_error_read_fail(module, monkeypatch):
-    class FakeHTTPError(module.urllib.error.HTTPError):
-        def __init__(self):
-            super().__init__("https://x", 500, "boom", hdrs=None, fp=None)
-        def read(self):
-            raise RuntimeError("no body")
 
     def raise_error(req, timeout=30):
         raise FakeHTTPError()
@@ -202,6 +220,7 @@ def test_api_request_http_error_read_fail(module, monkeypatch):
 def test_api_request_url_error(module, monkeypatch):
     def raise_error(req, timeout=30):
         raise module.urllib.error.URLError("down")
+
     monkeypatch.setattr(module.urllib.request, "urlopen", raise_error)
     assert module.api_request("https://example.com") is None
 
@@ -209,435 +228,415 @@ def test_api_request_url_error(module, monkeypatch):
 def test_api_request_timeout(module, monkeypatch):
     def raise_error(req, timeout=30):
         raise module.socket.timeout()
+
     monkeypatch.setattr(module.urllib.request, "urlopen", raise_error)
     assert module.api_request("https://example.com") is None
 
 
-def test_get_jellyfin_watched(module, monkeypatch):
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: {"Items": [{"Name": "Film", "ProviderIds": {"Tmdb": "123"}}]})
-    assert module.get_jellyfin_watched_movies() == {"123": "Film"}
-
-
-def test_get_jellyfin_watched_none(module, monkeypatch):
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: None)
-    assert module.get_jellyfin_watched_movies() is None
-
-
-def test_get_radarr_movies(module, monkeypatch):
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: [{"tmdbId": 123, "id": 1, "title": "Film", "path": "/movies/New/Film", "tags": []}])
-    result = module.get_radarr_movies()
-    assert result["123"]["title"] == "Film"
-
-
-def test_get_radarr_movies_none(module, monkeypatch):
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: None)
-    assert module.get_radarr_movies() is None
-
-
-def test_get_sonarr_series(module, monkeypatch):
-    module.CONFIG["sonarr_url"] = "https://sonarr.example.com"
-    module.CONFIG["sonarr_api_key"] = "sonarr-key"
+def test_get_jellyfin_user_id(module, monkeypatch):
     monkeypatch.setattr(
         module,
         "api_request",
-        lambda *a, **k: [{"tvdbId": 321, "id": 5, "title": "Show", "path": "/series/New/Show", "rootFolderPath": "/series/New", "tags": [1]}],
+        lambda *a, **k: [
+            {"Name": "other", "Id": "1"},
+            {"Name": "testuser", "Id": "abc123"},
+        ],
     )
-    result = module.get_sonarr_series()
-    assert result["321"]["title"] == "Show"
-    assert result["321"]["path"] == "/series/New/Show"
+    assert module.get_jellyfin_user_id() == "abc123"
 
 
-
-def test_get_sonarr_series_none(module, monkeypatch):
-    module.CONFIG["sonarr_url"] = "https://sonarr.example.com"
-    module.CONFIG["sonarr_api_key"] = "sonarr-key"
+def test_get_jellyfin_user_id_none(module, monkeypatch):
     monkeypatch.setattr(module, "api_request", lambda *a, **k: None)
-    assert module.get_sonarr_series() is None
+    assert module.get_jellyfin_user_id() is None
 
 
-def test_tag_radarr_movies(module, monkeypatch):
+def test_get_arr_tag_id(module, monkeypatch):
+    monkeypatch.setattr(
+        module,
+        "api_request",
+        lambda *a, **k: [{"id": 7, "label": "watched"}],
+    )
+    assert module.get_arr_tag_id("https://radarr.example.com", "key", "watched") == 7
+
+
+def test_get_arr_tag_id_missing(module, monkeypatch):
+    monkeypatch.setattr(module, "api_request", lambda *a, **k: [])
+    assert module.get_arr_tag_id("https://radarr.example.com", "key", "watched") is None
+
+
+def test_get_jellyfin_items_movies(module, monkeypatch):
+    monkeypatch.setattr(
+        module,
+        "api_request",
+        lambda *a, **k: {
+            "Items": [
+                {
+                    "Id": "jid1",
+                    "Name": "Film",
+                    "ProviderIds": {"Tmdb": "123"},
+                    "UserData": {"Played": True},
+                }
+            ]
+        },
+    )
+    result = module.get_jellyfin_items("user1", "movie")
+    assert result["123"].title == "Film"
+    assert result["123"].played is True
+
+
+def test_get_jellyfin_items_series(module, monkeypatch):
+    monkeypatch.setattr(
+        module,
+        "api_request",
+        lambda *a, **k: {
+            "Items": [
+                {
+                    "Id": "sid1",
+                    "Name": "Show",
+                    "ProviderIds": {"Tvdb": "321"},
+                    "UserData": {"Played": False},
+                }
+            ]
+        },
+    )
+    result = module.get_jellyfin_items("user1", "series")
+    assert result["321"].title == "Show"
+    assert result["321"].played is False
+
+
+def test_get_arr_items_movie(module, monkeypatch):
+    spec = module.SyncSpec(
+        kind="movie",
+        arr_name="Radarr",
+        arr_url="https://radarr.example.com",
+        arr_api_key="radarr-key",
+        watched_tag_name="watched",
+        new_root="/movies/New",
+        watched_root="/movies/Watched",
+    )
+
+    monkeypatch.setattr(
+        module,
+        "api_request",
+        lambda *a, **k: [
+            {
+                "id": 1,
+                "tmdbId": 123,
+                "title": "Film",
+                "path": "/movies/New/Film",
+                "rootFolderPath": "/movies/New",
+                "tags": [7],
+            }
+        ],
+    )
+
+    result = module.get_arr_items(spec)
+    assert result["123"].title == "Film"
+    assert result["123"].arr_id == 1
+
+
+def test_get_arr_items_series(module, monkeypatch):
+    spec = module.SyncSpec(
+        kind="series",
+        arr_name="Sonarr",
+        arr_url="https://sonarr.example.com",
+        arr_api_key="sonarr-key",
+        watched_tag_name="watched",
+        new_root="/series/New",
+        watched_root="/series/Watched",
+    )
+
+    monkeypatch.setattr(
+        module,
+        "api_request",
+        lambda *a, **k: [
+            {
+                "id": 5,
+                "tvdbId": 321,
+                "title": "Show",
+                "path": "/series/New/Show",
+                "rootFolderPath": "/series/New",
+                "tags": [1],
+            }
+        ],
+    )
+
+    result = module.get_arr_items(spec)
+    assert result["321"].title == "Show"
+    assert result["321"].arr_id == 5
+
+
+def test_apply_watched_tag_to_arr_movie(module, monkeypatch):
+    spec = module.SyncSpec(
+        kind="movie",
+        arr_name="Radarr",
+        arr_url="https://radarr.example.com",
+        arr_api_key="radarr-key",
+        watched_tag_name="watched",
+        new_root="/movies/New",
+        watched_root="/movies/Watched",
+    )
     monkeypatch.setattr(module, "api_request", lambda *a, **k: {"ok": True})
-    assert module.tag_radarr_movies([1], dry_run=False) is True
+    assert module.apply_watched_tag_to_arr(spec, [1], 7, dry_run=False) is True
 
 
-def test_tag_radarr_movies_empty(module):
-    assert module.tag_radarr_movies([], dry_run=False) is True
+def test_apply_watched_tag_to_arr_empty(module):
+    spec = module.SyncSpec(
+        kind="movie",
+        arr_name="Radarr",
+        arr_url="https://radarr.example.com",
+        arr_api_key="radarr-key",
+        watched_tag_name="watched",
+        new_root="/movies/New",
+        watched_root="/movies/Watched",
+    )
+    assert module.apply_watched_tag_to_arr(spec, [], 7, dry_run=False) is True
 
 
-def test_tag_radarr_movies_dry_run(module):
-    assert module.tag_radarr_movies([1], dry_run=True) is True
-
-
-def test_tag_radarr_movies_fail(module, monkeypatch):
+def test_apply_watched_tag_to_arr_fail(module, monkeypatch):
+    spec = module.SyncSpec(
+        kind="series",
+        arr_name="Sonarr",
+        arr_url="https://sonarr.example.com",
+        arr_api_key="sonarr-key",
+        watched_tag_name="watched",
+        new_root="/series/New",
+        watched_root="/series/Watched",
+    )
     monkeypatch.setattr(module, "api_request", lambda *a, **k: None)
-    assert module.tag_radarr_movies([1], dry_run=False) is False
+    assert module.apply_watched_tag_to_arr(spec, [5], 1, dry_run=False) is False
 
 
-def test_move_radarr_movies(module, monkeypatch):
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: {"ok": True})
-    assert module.move_radarr_movies([1], dry_run=False) == [1]
-
-
-def test_move_radarr_movies_empty(module):
-    assert module.move_radarr_movies([], dry_run=False) == []
-
-
-def test_move_radarr_movies_dry_run(module):
-    assert module.move_radarr_movies([1], dry_run=True) == []
-
-
-def test_move_radarr_movies_fail(module, monkeypatch):
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: None)
-    assert module.move_radarr_movies([1], dry_run=False) == []
-
-
-def test_fetch_jellyfin_movie_map(module, monkeypatch):
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: {"Items": [{"Id": "abc", "ProviderIds": {"Tmdb": "123"}}]})
-    assert module.fetch_jellyfin_movie_map() == {"123": "abc"}
-
-
-def test_fetch_jellyfin_movie_map_none(module, monkeypatch):
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: None)
-    assert module.fetch_jellyfin_movie_map() is None
-
-
-def test_update_jellyfin_paths(module, monkeypatch):
-    module.radarr_movies_cache = {"1": {"path": "/movies/New/A", "title": "A"}}
-    monkeypatch.setattr(module, "fetch_jellyfin_movie_map", lambda: {"1": "jid"})
+def test_mark_jellyfin_played(module, monkeypatch):
+    item = module.JellyfinItem(
+        jellyfin_id="jid1",
+        external_id="123",
+        title="Film",
+        played=False,
+    )
     calls = []
     monkeypatch.setattr(module, "api_request", lambda *a, **k: calls.append((a, k)) or {"ok": True})
-    module.update_jellyfin_movies_paths([1], dry_run=False)
+    module.mark_jellyfin_played("user1", [item], dry_run=False)
     assert calls
 
 
-def test_update_jellyfin_paths_dry_run(module, monkeypatch):
-    module.radarr_movies_cache = {"1": {"path": "/movies/New/A", "title": "A"}}
-    monkeypatch.setattr(module, "fetch_jellyfin_movie_map", lambda: {"1": "jid"})
-    module.update_jellyfin_movies_paths([1], dry_run=True)
+def test_mark_jellyfin_played_dry_run(module):
+    item = module.JellyfinItem(
+        jellyfin_id="jid1",
+        external_id="123",
+        title="Film",
+        played=False,
+    )
+    module.mark_jellyfin_played("user1", [item], dry_run=True)
 
 
-def test_update_jellyfin_paths_no_map(module, monkeypatch):
-    monkeypatch.setattr(module, "fetch_jellyfin_movie_map", lambda: None)
-    module.update_jellyfin_movies_paths([1], dry_run=False)
-
-
-def test_update_jellyfin_paths_skip_missing_tmdb(module, monkeypatch):
-    module.radarr_movies_cache = {}
-    monkeypatch.setattr(module, "fetch_jellyfin_movie_map", lambda: {"1": "jid"})
-    module.update_jellyfin_movies_paths([1], dry_run=False)
-
-
-def test_update_jellyfin_paths_skip_same_path(module, monkeypatch):
-    module.radarr_movies_cache = {"1": {"path": "/movies/Watched/A", "title": "A"}}
-    monkeypatch.setattr(module, "fetch_jellyfin_movie_map", lambda: {"1": "jid"})
-    module.update_jellyfin_movies_paths([1], dry_run=False)
-
-
-def test_update_jellyfin_paths_api_fail(module, monkeypatch):
-    module.radarr_movies_cache = {"1": {"path": "/movies/New/A", "title": "A"}}
-    monkeypatch.setattr(module, "fetch_jellyfin_movie_map", lambda: {"1": "jid"})
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: None)
-    module.update_jellyfin_movies_paths([1], dry_run=False)
-
-
-def test_trigger_path_refresh_dry_run(module):
-    module.trigger_path_refresh(dry_run=True)
-
-
-def test_trigger_path_refresh_success(module, monkeypatch):
+def test_move_arr_items(module, monkeypatch):
+    spec = module.SyncSpec(
+        kind="movie",
+        arr_name="Radarr",
+        arr_url="https://radarr.example.com",
+        arr_api_key="radarr-key",
+        watched_tag_name="watched",
+        new_root="/movies/New",
+        watched_root="/movies/Watched",
+    )
     monkeypatch.setattr(module, "api_request", lambda *a, **k: {"ok": True})
-    module.trigger_path_refresh(dry_run=False)
+    assert module.move_arr_items(spec, [1], dry_run=False) is True
 
 
-def test_trigger_path_refresh_fail(module, monkeypatch):
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: None)
-    module.trigger_path_refresh(dry_run=False)
+def test_move_arr_items_empty(module):
+    spec = module.SyncSpec(
+        kind="series",
+        arr_name="Sonarr",
+        arr_url="https://sonarr.example.com",
+        arr_api_key="sonarr-key",
+        watched_tag_name="watched",
+        new_root="/series/New",
+        watched_root="/series/Watched",
+    )
+    assert module.move_arr_items(spec, [], dry_run=False) is True
 
 
-def test_mark_jellyfin_unwatched_to_watched_dry_run(module, monkeypatch):
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: {"Items": [{"Id": "x", "Name": "Film", "ProviderIds": {"Tmdb": "1"}, "UserData": {"Played": False}}]})
-    module.mark_jellyfin_movies_unwatched_to_watched({"1"}, dry_run=True)
-
-
-def test_mark_jellyfin_unwatched_to_watched_success(module, monkeypatch):
-    responses = [
-        {"Items": [{"Id": "x", "Name": "Film", "ProviderIds": {"Tmdb": "1"}, "UserData": {"Played": False}}]},
-        {"ok": True},
-    ]
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: responses.pop(0))
-    module.mark_jellyfin_movies_unwatched_to_watched({"1"}, dry_run=False)
-
-
-def test_mark_jellyfin_unwatched_to_watched_api_fail(module, monkeypatch):
-    responses = [
-        {"Items": [{"Id": "x", "Name": "Film", "ProviderIds": {"Tmdb": "1"}, "UserData": {"Played": False}}]},
-        None,
-    ]
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: responses.pop(0))
-    module.mark_jellyfin_movies_unwatched_to_watched({"1"}, dry_run=False)
-
-
-def test_mark_jellyfin_unwatched_to_watched_none(module, monkeypatch):
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: None)
-    module.mark_jellyfin_movies_unwatched_to_watched({"1"}, dry_run=False)
-
-
-def test_mark_jellyfin_unwatched_to_watched_nothing(module, monkeypatch):
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: {"Items": []})
-    module.mark_jellyfin_movies_unwatched_to_watched({"1"}, dry_run=False)
-
-
-def test_get_jellyfin_watched_series(module, monkeypatch):
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: {"Items": [{"Name": "Show", "ProviderIds": {"Tvdb": "321"}}]})
-    assert module.get_jellyfin_watched_series("user-123") == {"321": "Show"}
-
-
-def test_get_jellyfin_watched_series_none(module, monkeypatch):
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: None)
-    assert module.get_jellyfin_watched_series("user-123") is None
-
-
-def test_get_jellyfin_watched_series_no_tvdb(module, monkeypatch):
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: {"Items": [{"Name": "Show", "ProviderIds": {}}]})
-    assert module.get_jellyfin_watched_series("user-123") == {}
-
-
-def test_tag_sonarr_series(module, monkeypatch):
-    module.CONFIG["sonarr_url"] = "https://sonarr.example.com"
-    module.CONFIG["sonarr_api_key"] = "sonarr-key"
+def test_trigger_jellyfin_refresh_success(module, monkeypatch):
     monkeypatch.setattr(module, "api_request", lambda *a, **k: {"ok": True})
-    assert module.tag_sonarr_series([5], 1, dry_run=False) is True
+    module.trigger_jellyfin_refresh(dry_run=False)
 
 
-def test_tag_sonarr_series_empty(module):
-    assert module.tag_sonarr_series([], 1, dry_run=False) is True
+def test_trigger_jellyfin_refresh_dry_run(module):
+    module.trigger_jellyfin_refresh(dry_run=True)
 
 
-def test_tag_sonarr_series_dry_run(module):
-    assert module.tag_sonarr_series([5], 1, dry_run=True) is True
+def test_sync_arr_to_jellyfin_played_marks_missing(module, monkeypatch):
+    spec = module.SyncSpec(
+        kind="movie",
+        arr_name="Radarr",
+        arr_url="https://radarr.example.com",
+        arr_api_key="radarr-key",
+        watched_tag_name="watched",
+        new_root="/movies/New",
+        watched_root="/movies/Watched",
+    )
 
+    jellyfin_items = {
+        "123": module.JellyfinItem("jid1", "123", "Film", False),
+    }
+    arr_items = {
+        "123": module.ArrItem(1, "123", "Film", "/movies/New/Film", "/movies/New", [7]),
+    }
 
-def test_tag_sonarr_series_fail(module, monkeypatch):
-    module.CONFIG["sonarr_url"] = "https://sonarr.example.com"
-    module.CONFIG["sonarr_api_key"] = "sonarr-key"
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: None)
-    assert module.tag_sonarr_series([5], 1, dry_run=False) is False
-
-
-def test_move_sonarr_series(module, monkeypatch):
-    module.CONFIG["sonarr_url"] = "https://sonarr.example.com"
-    module.CONFIG["sonarr_api_key"] = "sonarr-key"
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: {"ok": True})
-    assert module.move_sonarr_series([5], dry_run=False) == [5]
-
-
-def test_move_sonarr_series_empty(module):
-    assert module.move_sonarr_series([], dry_run=False) == []
-
-
-def test_move_sonarr_series_dry_run(module):
-    assert module.move_sonarr_series([5], dry_run=True) == []
-
-
-def test_move_sonarr_series_fail(module, monkeypatch):
-    module.CONFIG["sonarr_url"] = "https://sonarr.example.com"
-    module.CONFIG["sonarr_api_key"] = "sonarr-key"
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: None)
-    assert module.move_sonarr_series([5], dry_run=False) == []
-
-
-def test_fetch_jellyfin_series_map(module, monkeypatch):
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: {"Items": [{"Id": "s1", "ProviderIds": {"Tvdb": "321"}}]})
-    assert module.fetch_jellyfin_series_map() == {"321": "s1"}
-
-
-def test_fetch_jellyfin_series_map_none(module, monkeypatch):
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: None)
-    assert module.fetch_jellyfin_series_map() is None
-
-
-def test_update_jellyfin_series_paths(module, monkeypatch):
-    module.sonarr_series_cache = {"321": {"path": "/series/New/Show", "title": "Show"}}
-    module.CONFIG["series_new_root_folder"] = "/series/New"
-    module.CONFIG["series_watched_root_folder"] = "/series/Watched"
-    monkeypatch.setattr(module, "fetch_jellyfin_series_map", lambda: {"321": "s1"})
-    calls = []
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: calls.append((a, k)) or {"ok": True})
-    module.update_jellyfin_series_paths(["321"], dry_run=False)
-    assert calls
-
-
-def test_update_jellyfin_series_paths_dry_run(module, monkeypatch):
-    module.sonarr_series_cache = {"321": {"path": "/series/New/Show", "title": "Show"}}
-    module.CONFIG["series_new_root_folder"] = "/series/New"
-    module.CONFIG["series_watched_root_folder"] = "/series/Watched"
-    monkeypatch.setattr(module, "fetch_jellyfin_series_map", lambda: {"321": "s1"})
-    module.update_jellyfin_series_paths(["321"], dry_run=True)
-
-
-def test_update_jellyfin_series_paths_no_map(module, monkeypatch):
-    monkeypatch.setattr(module, "fetch_jellyfin_series_map", lambda: None)
-    module.update_jellyfin_series_paths(["321"], dry_run=False)
-
-
-def test_update_jellyfin_series_paths_skip_missing(module, monkeypatch):
-    module.sonarr_series_cache = {}
-    monkeypatch.setattr(module, "fetch_jellyfin_series_map", lambda: {"321": "s1"})
-    module.update_jellyfin_series_paths(["321"], dry_run=False)
-
-
-def test_update_jellyfin_series_paths_skip_same_path(module, monkeypatch):
-    module.sonarr_series_cache = {"321": {"path": "/series/Watched/Show", "title": "Show"}}
-    module.CONFIG["series_new_root_folder"] = "/series/New"
-    module.CONFIG["series_watched_root_folder"] = "/series/Watched"
-    monkeypatch.setattr(module, "fetch_jellyfin_series_map", lambda: {"321": "s1"})
-    module.update_jellyfin_series_paths(["321"], dry_run=False)
-
-
-def test_update_jellyfin_series_paths_api_fail(module, monkeypatch):
-    module.sonarr_series_cache = {"321": {"path": "/series/New/Show", "title": "Show"}}
-    module.CONFIG["series_new_root_folder"] = "/series/New"
-    module.CONFIG["series_watched_root_folder"] = "/series/Watched"
-    monkeypatch.setattr(module, "fetch_jellyfin_series_map", lambda: {"321": "s1"})
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: None)
-    module.update_jellyfin_series_paths(["321"], dry_run=False)
-
-
-def test_mark_jellyfin_series_unwatched_to_watched_dry_run(module, monkeypatch):
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: {"Items": [{"Id": "s1", "Name": "Show", "ProviderIds": {"Tvdb": "11"}, "UserData": {"Played": False}}]})
-    module.mark_jellyfin_series_unwatched_to_watched({"11"}, dry_run=True)
-
-
-
-def test_mark_jellyfin_series_unwatched_to_watched_success(module, monkeypatch):
-    responses = [
-        {"Items": [{"Id": "s1", "Name": "Show", "ProviderIds": {"Tvdb": "11"}, "UserData": {"Played": False}}]},
-        {"ok": True},
-    ]
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: responses.pop(0))
-    module.mark_jellyfin_series_unwatched_to_watched({"11"}, dry_run=False)
-
-
-
-def test_mark_jellyfin_series_unwatched_to_watched_api_fail(module, monkeypatch):
-    responses = [
-        {"Items": [{"Id": "s1", "Name": "Show", "ProviderIds": {"Tvdb": "11"}, "UserData": {"Played": False}}]},
-        None,
-    ]
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: responses.pop(0))
-    module.mark_jellyfin_series_unwatched_to_watched({"11"}, dry_run=False)
-
-
-
-def test_mark_jellyfin_series_unwatched_to_watched_none(module, monkeypatch):
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: None)
-    module.mark_jellyfin_series_unwatched_to_watched({"11"}, dry_run=False)
-
-
-
-def test_mark_jellyfin_series_unwatched_to_watched_nothing(module, monkeypatch):
-    monkeypatch.setattr(module, "api_request", lambda *a, **k: {"Items": []})
-    module.mark_jellyfin_series_unwatched_to_watched({"11"}, dry_run=False)
-
-
-def test_main_success(module, monkeypatch):
-    monkeypatch.setattr(module, "get_jellyfin_watched_movies", lambda: {"1": "Film"})
-    monkeypatch.setattr(module, "get_radarr_movies", lambda: {"1": {"id": 1, "title": "Film", "tags": [], "path": "/movies/New/A"}})
-    monkeypatch.setattr(module, "tag_radarr_movies", lambda *a, **k: True)
-    monkeypatch.setattr(module, "mark_jellyfin_unwatched_to_watched", lambda *a, **k: None)
-    monkeypatch.setattr(module, "move_radarr_movies", lambda *a, **k: [1])
-    monkeypatch.setattr(module, "update_jellyfin_paths", lambda *a, **k: None)
-    monkeypatch.setattr(module, "trigger_path_refresh", lambda *a, **k: None)
-    monkeypatch.setattr(module.time, "sleep", lambda *a, **k: None)
-    monkeypatch.setattr(module.argparse.ArgumentParser, "parse_args", lambda self: SimpleNamespace(dry_run=False, skip_move=False, skip_scan=False))
-    module.main()
-
-
-
-def test_main_with_sonarr_sync(module, monkeypatch):
-    module.CONFIG["sonarr_url"] = "https://sonarr.example.com"
-    module.CONFIG["sonarr_api_key"] = "sonarr-key"
-    module.CONFIG["sonarr_watched_tag_id"] = 1
-    module.CONFIG["series_new_root_folder"] = "/series/New"
-    monkeypatch.setattr(module, "get_jellyfin_watched_movies", lambda: {"1": "Film"})
-    monkeypatch.setattr(module, "get_radarr_movies", lambda: {"1": {"id": 1, "title": "Film", "tags": [1], "path": "/movies/Watched/A"}})
-    monkeypatch.setattr(module, "mark_jellyfin_unwatched_to_watched", lambda *a, **k: None)
-    monkeypatch.setattr(module, "get_jellyfin_watched_series", lambda uid: {"11": "Show"})
-    monkeypatch.setattr(module, "get_sonarr_series", lambda: {"11": {"id": 5, "title": "Show", "path": "/series/Watched/Show", "tags": [1]}})
-    monkeypatch.setattr(module, "tag_sonarr_series", lambda *a, **k: True)
     marked = []
-    monkeypatch.setattr(module, "mark_jellyfin_series_unwatched_to_watched", lambda tvdb_ids, uid, **k: marked.append(tvdb_ids))
-    monkeypatch.setattr(module, "trigger_path_refresh", lambda **k: None)
-    monkeypatch.setattr(module.argparse.ArgumentParser, "parse_args", lambda self: SimpleNamespace(dry_run=False, skip_move=True, skip_scan=True))
+    monkeypatch.setattr(module, "mark_jellyfin_played", lambda uid, items, dry_run: marked.extend(items))
+    module.sync_arr_to_jellyfin_played(
+        user_id="user1",
+        jellyfin_items=jellyfin_items,
+        arr_items=arr_items,
+        watched_tag_id=7,
+        dry_run=False,
+        spec=spec,
+        phase="repair",
+    )
+    assert len(marked) == 1
+    assert marked[0].title == "Film"
+
+
+def test_sync_media_type_movie_flow(module, monkeypatch):
+    spec = module.SyncSpec(
+        kind="movie",
+        arr_name="Radarr",
+        arr_url="https://radarr.example.com",
+        arr_api_key="radarr-key",
+        watched_tag_name="watched",
+        new_root="/movies/New",
+        watched_root="/movies/Watched",
+    )
+
+    monkeypatch.setattr(module, "get_arr_tag_id", lambda *a, **k: 7)
+
+    first_jellyfin = {
+        "123": module.JellyfinItem("jid1", "123", "Film", True),
+    }
+    second_jellyfin = {
+        "123": module.JellyfinItem("jid1", "123", "Film", False),
+    }
+    jellyfin_calls = [first_jellyfin, second_jellyfin]
+    monkeypatch.setattr(module, "get_jellyfin_items", lambda *a, **k: jellyfin_calls.pop(0))
+
+    arr_items = {
+        "123": module.ArrItem(1, "123", "Film", "/movies/New/Film", "/movies/New", []),
+    }
+    monkeypatch.setattr(module, "get_arr_items", lambda *a, **k: arr_items)
+    monkeypatch.setattr(module, "apply_watched_tag_to_arr", lambda *a, **k: True)
+
+    sync_phases = []
+    monkeypatch.setattr(
+        module,
+        "sync_arr_to_jellyfin_played",
+        lambda **kwargs: sync_phases.append(kwargs["phase"]),
+    )
+
+    moved_ids = []
+    monkeypatch.setattr(
+        module,
+        "move_arr_items",
+        lambda spec, ids, dry_run: (moved_ids.extend(ids) or True),
+    )
+    refresh_called = []
+    monkeypatch.setattr(module, "trigger_jellyfin_refresh", lambda dry_run: refresh_called.append(True))
+    monkeypatch.setattr(module.time, "sleep", lambda *a, **k: None)
+
+    module.sync_media_type(
+        spec=spec,
+        user_id="user1",
+        dry_run=False,
+        skip_move=False,
+        skip_refresh=False,
+    )
+
+    assert moved_ids == [1]
+    assert refresh_called == [True]
+    assert sync_phases == ["pre-move", "post-refresh-repair"]
+
+
+def test_sync_media_type_skip_refresh(module, monkeypatch):
+    spec = module.SyncSpec(
+        kind="movie",
+        arr_name="Radarr",
+        arr_url="https://radarr.example.com",
+        arr_api_key="radarr-key",
+        watched_tag_name="watched",
+        new_root="/movies/New",
+        watched_root="/movies/Watched",
+    )
+
+    monkeypatch.setattr(module, "get_arr_tag_id", lambda *a, **k: 7)
+    monkeypatch.setattr(module, "get_jellyfin_items", lambda *a, **k: {})
+    monkeypatch.setattr(module, "get_arr_items", lambda *a, **k: {})
+    monkeypatch.setattr(module, "sync_arr_to_jellyfin_played", lambda **kwargs: None)
+
+    called = []
+    monkeypatch.setattr(module, "trigger_jellyfin_refresh", lambda dry_run: called.append(True))
+
+    module.sync_media_type(
+        spec=spec,
+        user_id="user1",
+        dry_run=False,
+        skip_move=False,
+        skip_refresh=True,
+    )
+
+    assert called == []
+
+
+def test_main_movies_only(module, monkeypatch):
+    monkeypatch.setattr(module, "get_jellyfin_user_id", lambda: "user1")
+    called = []
+
+    monkeypatch.setattr(
+        module,
+        "sync_media_type",
+        lambda **kwargs: called.append(kwargs["spec"].arr_name),
+    )
+
+    monkeypatch.setattr(
+        module.argparse.ArgumentParser,
+        "parse_args",
+        lambda self: SimpleNamespace(dry_run=False, skip_move=False, skip_refresh=False),
+    )
+
     module.main()
-    assert marked == [{"11"}]
+    assert called == ["Radarr"]
 
 
-def test_main_with_sonarr_move(module, monkeypatch):
+def test_main_with_sonarr(module, monkeypatch):
     module.CONFIG["sonarr_url"] = "https://sonarr.example.com"
     module.CONFIG["sonarr_api_key"] = "sonarr-key"
-    module.CONFIG["sonarr_watched_tag_id"] = 1
-    module.CONFIG["series_new_root_folder"] = "/series/New"
-    module.CONFIG["series_watched_root_folder"] = "/series/Watched"
-    monkeypatch.setattr(module, "get_jellyfin_watched_movies", lambda: {})
-    monkeypatch.setattr(module, "get_radarr_movies", lambda: {})
-    monkeypatch.setattr(module, "mark_jellyfin_unwatched_to_watched", lambda *a, **k: None)
-    monkeypatch.setattr(module, "get_jellyfin_watched_series", lambda uid: {"11": "Show"})
-    monkeypatch.setattr(module, "get_sonarr_series", lambda: {"11": {"id": 5, "title": "Show", "path": "/series/New/Show", "tags": [1]}})
-    monkeypatch.setattr(module, "tag_sonarr_series", lambda *a, **k: True)
-    monkeypatch.setattr(module, "mark_jellyfin_series_unwatched_to_watched", lambda *a, **k: None)
-    moved_ids = []
-    monkeypatch.setattr(module, "move_sonarr_series", lambda ids, **k: (moved_ids.extend(ids) or ids))
-    updated_tvdb = []
-    monkeypatch.setattr(module, "update_jellyfin_series_paths", lambda tvdbs, **k: updated_tvdb.extend(tvdbs))
-    monkeypatch.setattr(module, "trigger_path_refresh", lambda **k: None)
-    monkeypatch.setattr(module.time, "sleep", lambda *a: None)
-    monkeypatch.setattr(module.argparse.ArgumentParser, "parse_args", lambda self: SimpleNamespace(dry_run=False, skip_move=False, skip_scan=True))
+
+    monkeypatch.setattr(module, "get_jellyfin_user_id", lambda: "user1")
+    called = []
+
+    monkeypatch.setattr(
+        module,
+        "sync_media_type",
+        lambda **kwargs: called.append(kwargs["spec"].arr_name),
+    )
+
+    monkeypatch.setattr(
+        module.argparse.ArgumentParser,
+        "parse_args",
+        lambda self: SimpleNamespace(dry_run=False, skip_move=False, skip_refresh=False),
+    )
+
     module.main()
-    assert moved_ids == [5]
-    assert updated_tvdb == ["11"]
+    assert called == ["Radarr", "Sonarr"]
 
 
-def test_main_fetch_fail(module, monkeypatch):
-    monkeypatch.setattr(module, "get_jellyfin_watched_movies", lambda: None)
-    monkeypatch.setattr(module.argparse.ArgumentParser, "parse_args", lambda self: SimpleNamespace(dry_run=False, skip_move=False, skip_scan=False))
+def test_main_no_jellyfin_user(module, monkeypatch):
+    monkeypatch.setattr(module, "get_jellyfin_user_id", lambda: None)
+    monkeypatch.setattr(
+        module.argparse.ArgumentParser,
+        "parse_args",
+        lambda self: SimpleNamespace(dry_run=False, skip_move=False, skip_refresh=False),
+    )
+
     with pytest.raises(SystemExit):
         module.main()
-
-
-def test_main_radarr_fail(module, monkeypatch):
-    monkeypatch.setattr(module, "get_jellyfin_watched_movies", lambda: {})
-    monkeypatch.setattr(module, "get_radarr_movies", lambda: None)
-    monkeypatch.setattr(module.argparse.ArgumentParser, "parse_args", lambda self: SimpleNamespace(dry_run=False, skip_move=False, skip_scan=False))
-    with pytest.raises(SystemExit):
-        module.main()
-
-
-def test_main_no_tag_skip_move_skip_scan(module, monkeypatch):
-    monkeypatch.setattr(module, "get_jellyfin_watched_movies", lambda: {"1": "Film"})
-    monkeypatch.setattr(module, "get_radarr_movies", lambda: {"1": {"id": 1, "title": "Film", "tags": [1], "path": "/movies/Watched/A"}})
-    monkeypatch.setattr(module, "mark_jellyfin_unwatched_to_watched", lambda *a, **k: None)
-    monkeypatch.setattr(module.argparse.ArgumentParser, "parse_args", lambda self: SimpleNamespace(dry_run=False, skip_move=True, skip_scan=True))
-    module.main()
-
-
-def test_main_dry_run_skip_scan(module, monkeypatch):
-    monkeypatch.setattr(module, "get_jellyfin_watched_movies", lambda: {"1": "Film"})
-    monkeypatch.setattr(module, "get_radarr_movies", lambda: {"1": {"id": 1, "title": "Film", "tags": [], "path": "/movies/New/A"}})
-    monkeypatch.setattr(module, "tag_radarr_movies", lambda *a, **k: True)
-    monkeypatch.setattr(module, "mark_jellyfin_unwatched_to_watched", lambda *a, **k: None)
-    monkeypatch.setattr(module, "move_radarr_movies", lambda *a, **k: [])
-    monkeypatch.setattr(module.argparse.ArgumentParser, "parse_args", lambda self: SimpleNamespace(dry_run=True, skip_move=False, skip_scan=False))
-    module.main()
-
-
-def test_main_move_branch_full(module, monkeypatch):
-    monkeypatch.setattr(module, "get_jellyfin_watched_movies", lambda: {"1": "Film"})
-    monkeypatch.setattr(module, "get_radarr_movies", lambda: {"1": {"id": 1, "title": "Film", "tags": [1], "path": "/movies/New/A"}})
-    monkeypatch.setattr(module, "mark_jellyfin_unwatched_to_watched", lambda *a, **k: None)
-    monkeypatch.setattr(module, "move_radarr_movies", lambda *a, **k: [1])
-    monkeypatch.setattr(module, "update_jellyfin_paths", lambda *a, **k: None)
-    monkeypatch.setattr(module, "trigger_path_refresh", lambda *a, **k: None)
-    monkeypatch.setattr(module.time, "sleep", lambda *a, **k: None)
-    monkeypatch.setattr(module.argparse.ArgumentParser, "parse_args", lambda self: SimpleNamespace(dry_run=False, skip_move=False, skip_scan=False))
-    module.main()
