@@ -8,6 +8,6 @@ services:
     environment:
       TZ: Europe/Berlin
       CRON_SCHEDULE: "0 */6 * * *"
-      RUN_ON_START: "false"
+      RUN_ON_START: "true"
     volumes:
       - ./logs:/logs

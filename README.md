@@ -1,18 +1,19 @@
-# Sync Watched
+# Jellyfin Media Status Sync
 
-Sync watched state between Jellyfin, Radarr, and Sonarr, and automatically move watched movies from a `New` root folder to a `Watched` root folder.
+Sync watched state between __Jellyfin__, __Radarr__, and __Sonarr__, and automatically move watched movies and series from a `New` folder to a `Watched` folder.
 
 ## Overview
 This project keeps Jellyfin, Radarr, and Sonarr aligned for watched media.
 
 It can:
-1. read watched movies from Jellyfin
-2. apply a watched tag in Radarr
+1. read watched movies from Jellyfin and apply the watched tag in Radarr
+2. read watched series from Jellyfin and apply the watched tag in Sonarr
 3. mark Jellyfin movies as watched when Radarr already has the watched tag
 4. mark Jellyfin series as watched when Sonarr already has the watched tag
-5. move watched movies from one root folder to another in Radarr
-6. update Jellyfin paths after the move
-7. trigger a Jellyfin path-only refresh
+5. move watched movies from the new folder to the watched folder via Radarr
+6. move watched series from the new folder to the watched folder via Sonarr
+7. update Jellyfin paths for moved movies and series
+8. trigger a Jellyfin path-only refresh
 
 ## Project files
 - `sync_watched.py`
@@ -42,15 +43,17 @@ Example values are provided in `.env.example`.
 Main settings:
 - `RADARR_URL`
 - `RADARR_API_KEY`
-- `SONARR_URL` optional, enables Jellyfin series sync from Sonarr watched tags
+- `SONARR_URL` optional, enables Sonarr series sync
 - `SONARR_API_KEY` optional, required when `SONARR_URL` is set
 - `JELLYFIN_URL`
 - `JELLYFIN_API_KEY`
-- `JELLYFIN_USER_ID`
-- `WATCHED_TAG_ID`
-- `SONARR_WATCHED_TAG_ID` optional, defaults to `WATCHED_TAG_ID`
-- `NEW_ROOT_FOLDER`
-- `WATCHED_ROOT_FOLDER`
+- `JELLYFIN_USERNAME`
+- `RADARR_WATCHED_TAG` defaults to `watched`
+- `SONARR_WATCHED_TAG` defaults to `watched`
+- `MOVIE_NEW_ROOT_FOLDER`
+- `MOVIE_WATCHED_ROOT_FOLDER`
+- `SERIES_NEW_ROOT_FOLDER`
+- `SERIES_WATCHED_ROOT_FOLDER`
 - `LOG_LEVEL`
 - `LOG_FILE`
 - `REQUEST_TIMEOUT`
@@ -61,14 +64,35 @@ Docker scheduler settings:
 - `CRON_SCHEDULE` for when the script should run, for example `0 */6 * * *`
 - `RUN_ON_START` set to `true` if you want one immediate run when the container starts
 
-The script validates required environment variables at startup and exits clearly if any are missing.
+The script validates required environment variables at startup and exits clearly if any are missing. It also exits if it cannot resolve the Jellyfin username or the watched tag names in Radarr or Sonarr.
+
+## Important behavior notes
+
+### Auto-resolution of IDs
+The script does not require you to look up internal IDs from the web UI. It resolves the following automatically at startup:
+- Jellyfin user ID from `JELLYFIN_USERNAME`
+- Radarr watched tag ID from `RADARR_WATCHED_TAG`
+- Sonarr watched tag ID from `SONARR_WATCHED_TAG`
+
+### Folder variables
+Movies and series have separate root folder variables:
+
+Movie folders:
+- `MOVIE_NEW_ROOT_FOLDER`
+- `MOVIE_WATCHED_ROOT_FOLDER`
+
+Series folders:
+- `SERIES_NEW_ROOT_FOLDER`
+- `SERIES_WATCHED_ROOT_FOLDER`
 
 ## Preconditions
 Before running the script:
 - the source and target movie folders must already exist
-- those folders must already be configured in Radarr as valid root folders
+- those movie folders must already be configured in Radarr as valid root folders
+- if Sonarr is used, your series folders must already exist and be configured there too
 - Jellyfin must already be configured to see those paths correctly
-- the movies should already be managed in Radarr and visible in Jellyfin
+- the media should already be managed in Radarr and/or Sonarr and visible in Jellyfin
+- the watched tag names you configure must already exist in Radarr and Sonarr
 
 This project assumes the media server and folder structure already exist. It does not create or configure them for you.
 
@@ -129,32 +153,17 @@ If `LOG_FILE` is set, logs are also written to that file with rotation.
 ## Error handling
 The script:
 - validates required environment variables at startup
-- handles HTTP, URL, and timeout failures more cleanly
+- resolves Jellyfin user ID from username
+- resolves Radarr and Sonarr watched tag IDs from tag names
+- handles HTTP, URL, and timeout failures cleanly
 - exits early if the initial Jellyfin or Radarr fetch fails
-- logs failures in a more professional and consistent way
+- logs failures in a consistent and readable way
 
 ## Tests
-The project has a pytest suite with strong coverage.
+The project has a pytest suite covering all sync, tagging, move, and path-update logic for both movies and series.
 
-Current status:
-- `55` tests passing locally
-- pytest suite now covers both movie sync and Sonarr series sync paths
+Run the tests:
+```bash
+python3 -m pytest tests/
+```
 
-## Security note
-Do not commit your real `.env` file.
-Keep credentials out of source control.
-Avoid putting real API keys directly into `docker-compose.yml`.
-
-## Current status
-Implemented:
-- env-based configuration
-- config validation
-- structured logging
-- cleaned error handling
-- automated tests
-- high coverage test suite
-- Dockerized scheduled runtime
-- Sonarr watched-tag to Jellyfin series played-state sync
-
-Still missing:
-- final publish-safe polish pass
