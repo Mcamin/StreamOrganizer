@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 """
-media-status-sync.py — Sync watched status between Jellyfin, Radarr, and Sonarr.
+media_status_sync.py
 
-Flow:  1. Query Jellyfin for watched movies and tag them in Radarr
-  2. Mark Jellyfin movies as watched when Radarr already has the watched tag
-  3. Query Jellyfin for watched series and tag them in Sonarr
-  4. Mark Jellyfin series as watched when Sonarr already has the watched tag
-  5. Move watched movies from the new root folder to the watched root folder
-  6. Update Jellyfin paths for moved movies
-  7. Move watched series from the new root folder to the watched root folder
-  8. Update Jellyfin paths for moved series
-  9. Trigger a Jellyfin path-only refresh
-
-Usage:
-  python3 sync_watched.py [--dry-run] [--skip-move] [--skip-scan]
+Safe sync flow:
+1. Fetch Jellyfin + Radarr/Sonarr items
+2. Sync Jellyfin played -> Arr watched tag
+3. Sync Arr watched tag -> Jellyfin played
+4. Move watched items in Arr from New -> Watched
+5. Trigger Jellyfin refresh
+6. Re-fetch Jellyfin items
+7. Re-apply Arr watched tag -> Jellyfin played as repair
 """
 
 from __future__ import annotations
@@ -25,13 +21,17 @@ import socket
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from dotenv import load_dotenv
 from loguru import logger
 
 load_dotenv()
+
+MediaKind = Literal["movie", "series"]
 
 
 def require_env(name: str) -> str:
@@ -50,39 +50,34 @@ def load_config() -> dict[str, Any]:
     return {
         "radarr_url": normalize_url(require_env("RADARR_URL")),
         "radarr_api_key": require_env("RADARR_API_KEY"),
-
         "sonarr_url": normalize_url(os.environ.get("SONARR_URL", "").strip()),
         "sonarr_api_key": os.environ.get("SONARR_API_KEY", "").strip(),
-
         "jellyfin_url": normalize_url(require_env("JELLYFIN_URL")),
         "jellyfin_api_key": require_env("JELLYFIN_API_KEY"),
         "jellyfin_username": require_env("JELLYFIN_USERNAME"),
-
         "radarr_watched_tag": os.environ.get("RADARR_WATCHED_TAG", "watched").strip() or "watched",
         "sonarr_watched_tag": os.environ.get("SONARR_WATCHED_TAG", "watched").strip() or "watched",
-
         "movie_new_root_folder": os.environ.get("MOVIE_NEW_ROOT_FOLDER", "/movies/New"),
         "movie_watched_root_folder": os.environ.get("MOVIE_WATCHED_ROOT_FOLDER", "/movies/Watched"),
-
         "series_new_root_folder": os.environ.get("SERIES_NEW_ROOT_FOLDER", "/series/New"),
         "series_watched_root_folder": os.environ.get("SERIES_WATCHED_ROOT_FOLDER", "/series/Watched"),
-
         "log_level": os.environ.get("LOG_LEVEL", "INFO"),
         "log_file": os.environ.get("LOG_FILE", "").strip(),
-
         "request_timeout": int(os.environ.get("REQUEST_TIMEOUT", "30")),
         "move_wait_seconds": int(os.environ.get("MOVE_WAIT_SECONDS", "10")),
+        "request_retries": int(os.environ.get("REQUEST_RETRIES", "3")),
+        "request_retry_delay": int(os.environ.get("REQUEST_RETRY_DELAY", "5")),
+        "jellyfin_limit": int(os.environ.get("JELLYFIN_LIMIT", "1000")),
+        "jellyfin_path_updates_only": os.environ.get("JELLYFIN_PATH_UPDATES_ONLY", "true").lower() == "true",
     }
 
 
 def setup_logging(config: dict[str, Any]) -> None:
     logger.remove()
     logger.add(sys.stderr, level=config["log_level"], enqueue=False, backtrace=False, diagnose=False)
-
-    log_file = config["log_file"]
-    if log_file:
+    if config["log_file"]:
         logger.add(
-            log_file,
+            config["log_file"],
             level=config["log_level"],
             rotation="10 MB",
             retention=5,
@@ -95,15 +90,12 @@ def setup_logging(config: dict[str, Any]) -> None:
 CONFIG = load_config()
 setup_logging(CONFIG)
 
-radarr_movies_cache: dict[str, dict[str, Any]] = {}
-sonarr_series_cache: dict[str, dict[str, Any]] = {}
-
 
 def api_request(
     url: str,
     *,
     method: str = "GET",
-    data: dict[str, Any] | None = None,
+    data: dict[str, Any] | list[Any] | None = None,
     api_key: str | None = None,
     emby_token: str | None = None,
 ) -> dict[str, Any] | list[Any] | None:
@@ -113,40 +105,81 @@ def api_request(
     if emby_token:
         headers["X-Emby-Token"] = emby_token
 
-    body = json.dumps(data).encode() if data is not None else None
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    body = json.dumps(data).encode("utf-8") if data is not None else None
 
-    try:
-        with urllib.request.urlopen(req, timeout=CONFIG["request_timeout"]) as resp:
-            if resp.status not in (200, 204):
-                logger.error("Unexpected HTTP status {} for {} {}", resp.status, method, url)
+    for attempt in range(1, CONFIG["request_retries"] + 1):
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=CONFIG["request_timeout"]) as resp:
+                if resp.status not in (200, 201, 202, 204):
+                    logger.error("Unexpected HTTP status {} for {} {}", resp.status, method, url)
+                    return None
+
+                raw = resp.read()
+                if not raw:
+                    return {"status": resp.status}
+
+                try:
+                    return json.loads(raw.decode("utf-8"))
+                except json.JSONDecodeError:
+                    return {"status": resp.status, "raw": raw.decode(errors="replace")}
+
+        except urllib.error.HTTPError as exc:
+            logger.error("HTTP {} for {} {}", exc.code, method, url)
+            try:
+                error_body = exc.read().decode(errors="replace")
+                if error_body:
+                    logger.error("Response body: {}", error_body[:1000])
+            except Exception:
+                pass
+            return None
+
+        except (urllib.error.URLError, socket.timeout) as exc:
+            reason = getattr(exc, "reason", exc)
+            if attempt < CONFIG["request_retries"]:
+                logger.warning(
+                    "Attempt {}/{} failed for {} {}: {}",
+                    attempt,
+                    CONFIG["request_retries"],
+                    method,
+                    url,
+                    reason,
+                )
+                time.sleep(CONFIG["request_retry_delay"])
+            else:
+                logger.error("Request failed for {} {}: {}", method, url, reason)
                 return None
 
-            raw = resp.read()
-            if not raw:
-                return {"status": resp.status}
+    return None
 
-            try:
-                return json.loads(raw.decode())
-            except json.JSONDecodeError:
-                logger.warning("Non-JSON response for {} {}", method, url)
-                return {"status": resp.status, "raw": raw.decode(errors="replace")}
 
-    except urllib.error.HTTPError as exc:
-        logger.error("HTTP {} for {} {}", exc.code, method, url)
-        try:
-            error_body = exc.read().decode(errors="replace")
-            if error_body:
-                logger.error("Response body: {}", error_body[:500])
-        except Exception:
-            pass
-        return None
-    except urllib.error.URLError as exc:
-        logger.error("Request failed for {} {}: {}", method, url, exc.reason)
-        return None
-    except socket.timeout:
-        logger.error("Request timed out for {} {}", method, url)
-        return None
+@dataclass
+class ArrItem:
+    arr_id: int
+    external_id: str
+    title: str
+    path: str
+    root_folder_path: str
+    tags: list[int]
+
+
+@dataclass
+class JellyfinItem:
+    jellyfin_id: str
+    external_id: str
+    title: str
+    played: bool
+
+
+@dataclass
+class SyncSpec:
+    kind: MediaKind
+    arr_name: str
+    arr_url: str
+    arr_api_key: str
+    watched_tag_name: str
+    new_root: str
+    watched_root: str
 
 
 def get_jellyfin_user_id() -> str | None:
@@ -157,8 +190,7 @@ def get_jellyfin_user_id() -> str | None:
 
     target = CONFIG["jellyfin_username"].casefold()
     for user in data:
-        name = str(user.get("Name", "")).casefold()
-        if name == target:
+        if str(user.get("Name", "")).casefold() == target:
             user_id = user.get("Id")
             if user_id:
                 return str(user_id)
@@ -166,559 +198,363 @@ def get_jellyfin_user_id() -> str | None:
 
 
 def get_arr_tag_id(base_url: str, api_key: str, tag_name: str) -> int | None:
-    url = f"{base_url}/api/v3/tag"
-    data = api_request(url, api_key=api_key)
+    data = api_request(f"{base_url}/api/v3/tag", api_key=api_key)
     if not isinstance(data, list):
         return None
 
     target = tag_name.casefold()
     for tag in data:
-        label = str(tag.get("label", "")).casefold()
-        if label == target:
+        if str(tag.get("label", "")).casefold() == target:
             tag_id = tag.get("id")
             if tag_id is not None:
                 return int(tag_id)
     return None
 
 
-def get_jellyfin_watched_movies(jellyfin_user_id: str) -> dict[str, str] | None:
-    url = (
-        f"{CONFIG['jellyfin_url']}/Users/{jellyfin_user_id}/Items"
-        f"?Filters=IsPlayed&IncludeItemTypes=Movie&Recursive=true"
-        f"&Fields=ProviderIds&api_key={CONFIG['jellyfin_api_key']}&Limit=500"
-    )
-    data = api_request(url, emby_token=CONFIG["jellyfin_api_key"])
-    if not isinstance(data, dict):
-        return None
+def get_jellyfin_items(user_id: str, kind: MediaKind) -> dict[str, JellyfinItem]:
+    include_type = "Movie" if kind == "movie" else "Series"
+    provider_key = "Tmdb" if kind == "movie" else "Tvdb"
 
-    result: dict[str, str] = {}
-    for item in data.get("Items", []):
-        providers = item.get("ProviderIds", {})
-        tmdb = providers.get("Tmdb")
-        if tmdb:
-            result[str(tmdb)] = item["Name"]
-    return result
-
-def get_jellyfin_watched_series(jellyfin_user_id: str) -> dict[str, str] | None:
-    url = (
-        f"{CONFIG['jellyfin_url']}/Users/{jellyfin_user_id}/Items"
-        f"?Filters=IsPlayed&IncludeItemTypes=Series&Recursive=true"
-        f"&Fields=ProviderIds&api_key={CONFIG['jellyfin_api_key']}&Limit=500"
-    )
-    data = api_request(url, emby_token=CONFIG["jellyfin_api_key"])
-    if not isinstance(data, dict):
-        return None
-
-    result: dict[str, str] = {}
-    for item in data.get("Items", []):
-        providers = item.get("ProviderIds", {})
-        tvdb = providers.get("Tvdb")
-        if tvdb:
-            result[str(tvdb)] = item["Name"]
-    return result
-
-
-
-def get_radarr_movies() -> dict[str, dict[str, Any]] | None:
-    url = f"{CONFIG['radarr_url']}/api/v3/movie"
-    data = api_request(url, api_key=CONFIG["radarr_api_key"])
-    if not isinstance(data, list):
-        return None
-
-    result: dict[str, dict[str, Any]] = {}
-    for movie in data:
-        result[str(movie["tmdbId"])] = {
-            "id": movie["id"],
-            "title": movie["title"],
-            "path": movie["path"],
-            "rootFolderPath": movie.get("rootFolderPath", ""),
-            "tags": movie.get("tags", []),
-            "qualityProfileId": movie.get("qualityProfileId", 1),
-            "monitored": movie.get("monitored", True),
+    query = urllib.parse.urlencode(
+        {
+            "Recursive": "true",
+            "IncludeItemTypes": include_type,
+            "Fields": "ProviderIds,UserData",
+            "api_key": CONFIG["jellyfin_api_key"],
+            "Limit": CONFIG["jellyfin_limit"],
         }
-    return result
+    )
+    url = f"{CONFIG['jellyfin_url']}/Users/{user_id}/Items?{query}"
+    data = api_request(url, emby_token=CONFIG["jellyfin_api_key"])
 
+    result: dict[str, JellyfinItem] = {}
+    if not isinstance(data, dict):
+        return result
 
-def get_sonarr_series() -> dict[str, dict[str, Any]] | None:
-    url = f"{CONFIG['sonarr_url']}/api/v3/series"
-    data = api_request(url, api_key=CONFIG["sonarr_api_key"])
-    if not isinstance(data, list):
-        return None
-
-    result: dict[str, dict[str, Any]] = {}
-    for series in data:
-        tvdb_id = series.get("tvdbId")
-        if not tvdb_id:
+    for item in data.get("Items", []):
+        provider_ids = item.get("ProviderIds", {})
+        external_id = provider_ids.get(provider_key)
+        if not external_id:
             continue
 
-        result[str(tvdb_id)] = {
-            "id": series["id"],
-            "title": series["title"],
-            "path": series.get("path", ""),
-            "rootFolderPath": series.get("rootFolderPath", ""),
-            "tags": series.get("tags", []),
-        }
+        result[str(external_id)] = JellyfinItem(
+            jellyfin_id=str(item["Id"]),
+            external_id=str(external_id),
+            title=str(item.get("Name", "")),
+            played=bool(item.get("UserData", {}).get("Played", False)),
+        )
     return result
 
 
-def tag_radarr_movies(movie_ids: list[int], watched_tag_id: int, dry_run: bool = False) -> bool:
-    if not movie_ids:
+def get_arr_items(spec: SyncSpec) -> dict[str, ArrItem]:
+    endpoint = "movie" if spec.kind == "movie" else "series"
+    external_key = "tmdbId" if spec.kind == "movie" else "tvdbId"
+
+    data = api_request(f"{spec.arr_url}/api/v3/{endpoint}", api_key=spec.arr_api_key)
+
+    result: dict[str, ArrItem] = {}
+    if not isinstance(data, list):
+        return result
+
+    for item in data:
+        external_id = item.get(external_key)
+        if not external_id:
+            continue
+
+        result[str(external_id)] = ArrItem(
+            arr_id=int(item["id"]),
+            external_id=str(external_id),
+            title=str(item.get("title", "")),
+            path=str(item.get("path", "")),
+            root_folder_path=str(item.get("rootFolderPath", "")),
+            tags=list(item.get("tags", [])),
+        )
+    return result
+
+
+def apply_watched_tag_to_arr(spec: SyncSpec, arr_ids: list[int], watched_tag_id: int, dry_run: bool) -> bool:
+    if not arr_ids:
         return True
 
     if dry_run:
-        logger.info("[DRY-RUN] Would tag {} movies as watched in Radarr", len(movie_ids))
+        logger.info("[DRY-RUN] Would tag {} {} items in {}", len(arr_ids), spec.kind, spec.arr_name)
         return True
 
-    url = f"{CONFIG['radarr_url']}/api/v3/movie/editor"
+    endpoint = "movie/editor" if spec.kind == "movie" else "series/editor"
+    ids_key = "movieIds" if spec.kind == "movie" else "seriesIds"
+
     payload = {
-        "movieIds": movie_ids,
+        ids_key: arr_ids,
         "tags": [watched_tag_id],
         "applyTags": "add",
     }
-    result = api_request(url, method="PUT", data=payload, api_key=CONFIG["radarr_api_key"])
-    if result is None:
-        logger.error("Failed to tag movies in Radarr")
-        return False
-    return True
+
+    result = api_request(
+        f"{spec.arr_url}/api/v3/{endpoint}",
+        method="PUT",
+        data=payload,
+        api_key=spec.arr_api_key,
+    )
+    return result is not None
 
 
-def move_radarr_movies(movie_ids: list[int], dry_run: bool = False) -> list[int]:
-    if not movie_ids:
-        return []
+def mark_jellyfin_played(user_id: str, items: list[JellyfinItem], dry_run: bool) -> None:
+    for item in items:
+        if dry_run:
+            logger.info("[DRY-RUN] Would mark '{}' as watched in Jellyfin", item.title)
+            continue
 
-    if dry_run:
-        logger.info("[DRY-RUN] Would move {} movies to {}", len(movie_ids), CONFIG["movie_watched_root_folder"])
-        return []
-
-    url = f"{CONFIG['radarr_url']}/api/v3/movie/editor"
-    payload = {
-        "movieIds": movie_ids,
-        "rootFolderPath": CONFIG["movie_watched_root_folder"],
-        "moveFiles": True,
-    }
-    result = api_request(url, method="PUT", data=payload, api_key=CONFIG["radarr_api_key"])
-    if result is None:
-        logger.error("Failed to move movies in Radarr")
-        return []
-    return movie_ids
+        url = (
+            f"{CONFIG['jellyfin_url']}/Users/{user_id}/PlayedItems/{item.jellyfin_id}"
+            f"?api_key={CONFIG['jellyfin_api_key']}"
+        )
+        result = api_request(url, method="POST", emby_token=CONFIG["jellyfin_api_key"])
+        if result is None:
+            logger.error("Failed to mark '{}' as watched in Jellyfin", item.title)
+        else:
+            logger.info("Marked '{}' as watched in Jellyfin", item.title)
 
 
-
-def tag_sonarr_series(series_ids: list[int], watched_tag_id: int, dry_run: bool = False) -> bool:
-    if not series_ids:
+def move_arr_items(spec: SyncSpec, arr_ids: list[int], dry_run: bool) -> bool:
+    if not arr_ids:
         return True
 
     if dry_run:
-        logger.info("[DRY-RUN] Would tag {} series as watched in Sonarr", len(series_ids))
+        logger.info("[DRY-RUN] Would move {} {} items to {}", len(arr_ids), spec.kind, spec.watched_root)
         return True
 
-    url = f"{CONFIG['sonarr_url']}/api/v3/series/editor"
+    endpoint = "movie/editor" if spec.kind == "movie" else "series/editor"
+    ids_key = "movieIds" if spec.kind == "movie" else "seriesIds"
+
     payload = {
-        "seriesIds": series_ids,
-        "tags": [watched_tag_id],
-        "applyTags": "add",
-    }
-    result = api_request(url, method="PUT", data=payload, api_key=CONFIG["sonarr_api_key"])
-    if result is None:
-        logger.error("Failed to tag series in Sonarr")
-        return False
-    return True
-
-
-def move_sonarr_series(series_ids: list[int], dry_run: bool = False) -> list[int]:
-    if not series_ids:
-        return []
-
-    if dry_run:
-        logger.info("[DRY-RUN] Would move {} series to {}", len(series_ids), CONFIG["series_watched_root_folder"])
-        return []
-
-    url = f"{CONFIG['sonarr_url']}/api/v3/series/editor"
-    payload = {
-        "seriesIds": series_ids,
-        "rootFolderPath": CONFIG["series_watched_root_folder"],
+        ids_key: arr_ids,
+        "rootFolderPath": spec.watched_root,
         "moveFiles": True,
     }
-    result = api_request(url, method="PUT", data=payload, api_key=CONFIG["sonarr_api_key"])
-    if result is None:
-        logger.error("Failed to move series in Sonarr")
-        return []
-    return series_ids
 
-
-def fetch_jellyfin_series_map() -> dict[str, str] | None:
-    url = (
-        f"{CONFIG['jellyfin_url']}/Items?Recursive=true&IncludeItemTypes=Series"
-        f"&Fields=ProviderIds&api_key={CONFIG['jellyfin_api_key']}&Limit=500"
+    result = api_request(
+        f"{spec.arr_url}/api/v3/{endpoint}",
+        method="PUT",
+        data=payload,
+        api_key=spec.arr_api_key,
     )
-    data = api_request(url, emby_token=CONFIG["jellyfin_api_key"])
-    if not isinstance(data, dict):
-        return None
-
-    result: dict[str, str] = {}
-    for item in data.get("Items", []):
-        providers = item.get("ProviderIds", {})
-        tvdb = providers.get("Tvdb")
-        if tvdb:
-            result[str(tvdb)] = item["Id"]
-    return result
+    return result is not None
 
 
-def update_jellyfin_series_paths(moved_tvdb_ids: list[str], dry_run: bool = False) -> None:
-    jellyfin_map = fetch_jellyfin_series_map()
-    if jellyfin_map is None:
-        logger.error("Could not fetch Jellyfin series for path updates")
-        return
-
-    for tvdb in moved_tvdb_ids:
-        if tvdb not in jellyfin_map or tvdb not in sonarr_series_cache:
-            continue
-
-        old_path = sonarr_series_cache[tvdb]["path"]
-        new_path = old_path.replace(CONFIG["series_new_root_folder"], CONFIG["series_watched_root_folder"])
-        if old_path == new_path:
-            continue
-
-        if dry_run:
-            logger.info("[DRY-RUN] Would update Jellyfin series path: {} -> {}", old_path, new_path)
-            continue
-
-        url = f"{CONFIG['jellyfin_url']}/Items/{jellyfin_map[tvdb]}"
-        payload = {"Path": new_path}
-        result = api_request(url, method="POST", data=payload, api_key=CONFIG["jellyfin_api_key"])
-        if result is None:
-            logger.error("Failed to update Jellyfin path for {}", sonarr_series_cache[tvdb]["title"])
-        else:
-            logger.info("Updated Jellyfin series path for {}", sonarr_series_cache[tvdb]["title"])
-
-
-def fetch_jellyfin_movie_map() -> dict[str, str] | None:
-    url = (
-        f"{CONFIG['jellyfin_url']}/Items?Recursive=true&IncludeItemTypes=Movie"
-        f"&Fields=ProviderIds&api_key={CONFIG['jellyfin_api_key']}&Limit=500"
-    )
-    data = api_request(url, emby_token=CONFIG["jellyfin_api_key"])
-    if not isinstance(data, dict):
-        return None
-
-    result: dict[str, str] = {}
-    for item in data.get("Items", []):
-        providers = item.get("ProviderIds", {})
-        tmdb = providers.get("Tmdb")
-        if tmdb:
-            result[str(tmdb)] = item["Id"]
-    return result
-
-
-def update_jellyfin_movies_paths(moved_items: list[int], dry_run: bool = False) -> None:
-    jellyfin_map = fetch_jellyfin_movie_map()
-    if jellyfin_map is None:
-        logger.error("Could not fetch Jellyfin items for path updates")
-        return
-
-    for movie_id in moved_items:
-        tmdb = str(movie_id)
-        if tmdb not in jellyfin_map or tmdb not in radarr_movies_cache:
-            continue
-
-        old_path = radarr_movies_cache[tmdb]["path"]
-        new_path = old_path.replace(CONFIG["movie_new_root_folder"], CONFIG["movie_watched_root_folder"])
-        if old_path == new_path:
-            continue
-
-        if dry_run:
-            logger.info("[DRY-RUN] Would update Jellyfin path: {} -> {}", old_path, new_path)
-            continue
-
-        url = f"{CONFIG['jellyfin_url']}/Items/{jellyfin_map[tmdb]}"
-        payload = {"Path": new_path}
-        result = api_request(url, method="POST", data=payload, api_key=CONFIG["jellyfin_api_key"])
-        if result is None:
-            logger.error("Failed to update Jellyfin path for {}", radarr_movies_cache[tmdb]["title"])
-        else:
-            logger.info("Updated Jellyfin path for {}", radarr_movies_cache[tmdb]["title"])
-
-
-def trigger_path_refresh(dry_run: bool = False) -> None:
+def trigger_jellyfin_refresh(dry_run: bool) -> None:
     if dry_run:
-        logger.info("[DRY-RUN] Would trigger path-only refresh")
+        logger.info(
+            "[DRY-RUN] Would trigger Jellyfin refresh (PathUpdatesOnly={})",
+            CONFIG["jellyfin_path_updates_only"],
+        )
         return
 
-    url = f"{CONFIG['jellyfin_url']}/Library/Refresh"
     payload = {
-        "PathUpdatesOnly": True,
+        "PathUpdatesOnly": CONFIG["jellyfin_path_updates_only"],
         "MediaTypes": ["Video"],
         "ImageRefreshMode": "Default",
         "MetadataRefreshMode": "Default",
+        "ReplaceAllMetadata": False,
+        "ReplaceAllImages": False,
     }
-    result = api_request(url, method="POST", data=payload, emby_token=CONFIG["jellyfin_api_key"])
+
+    result = api_request(
+        f"{CONFIG['jellyfin_url']}/Library/Refresh",
+        method="POST",
+        data=payload,
+        emby_token=CONFIG["jellyfin_api_key"],
+    )
     if result is None:
-        logger.error("Jellyfin path-only refresh failed")
+        logger.error("Jellyfin refresh failed")
     else:
-        logger.info("Jellyfin path-only refresh triggered")
+        logger.info("Triggered Jellyfin refresh")
 
 
-def mark_jellyfin_movies_unwatched_to_watched(radarr_watched_tmdb: set[str], jellyfin_user_id: str, dry_run: bool = False) -> None:
-    url = (
-        f"{CONFIG['jellyfin_url']}/Users/{jellyfin_user_id}/Items?Recursive=true&IncludeItemTypes=Movie"
-        f"&Fields=ProviderIds,UserData&api_key={CONFIG['jellyfin_api_key']}&Limit=500"
-    )
-    data = api_request(url, emby_token=CONFIG["jellyfin_api_key"])
-    if not isinstance(data, dict):
-        logger.error("Could not fetch Jellyfin items for watched sync")
-        return
-
-    to_mark: list[tuple[str, str]] = []
-    for item in data.get("Items", []):
-        providers = item.get("ProviderIds", {})
-        tmdb = providers.get("Tmdb")
-        played = item.get("UserData", {}).get("Played", False)
-        if tmdb and str(tmdb) in radarr_watched_tmdb and not played:
-            to_mark.append((item["Id"], item["Name"]))
-
-    if not to_mark:
-        logger.info("All Jellyfin movies already synced, nothing to mark")
-        return
-
-    for item_id, name in to_mark:
-        if dry_run:
-            logger.info("[DRY-RUN] Would mark '{}' as watched in Jellyfin", name)
-            continue
-
-        mark_url = (
-            f"{CONFIG['jellyfin_url']}/Users/{jellyfin_user_id}/PlayedItems/{item_id}"
-            f"?api_key={CONFIG['jellyfin_api_key']}"
-        )
-        result = api_request(mark_url, method="POST", emby_token=CONFIG["jellyfin_api_key"])
-        if result is None:
-            logger.error("Failed to mark '{}' as watched in Jellyfin", name)
-        else:
-            logger.info("Marked '{}' as watched in Jellyfin", name)
-
-
-def mark_jellyfin_series_unwatched_to_watched(
-    sonarr_watched_tvdb: set[str], jellyfin_user_id: str, dry_run: bool = False
+def sync_arr_to_jellyfin_played(
+    user_id: str,
+    jellyfin_items: dict[str, JellyfinItem],
+    arr_items: dict[str, ArrItem],
+    watched_tag_id: int,
+    dry_run: bool,
+    spec: SyncSpec,
+    phase: str,
 ) -> None:
-    url = (
-        f"{CONFIG['jellyfin_url']}/Users/{jellyfin_user_id}/Items?Recursive=true&IncludeItemTypes=Series"
-        f"&Fields=ProviderIds,UserData&api_key={CONFIG['jellyfin_api_key']}&Limit=500"
-    )
-    data = api_request(url, emby_token=CONFIG["jellyfin_api_key"])
-    if not isinstance(data, dict):
-        logger.error("Could not fetch Jellyfin series for watched sync")
-        return
+    to_mark: list[JellyfinItem] = []
 
-    to_mark: list[tuple[str, str]] = []
-    for item in data.get("Items", []):
-        providers = item.get("ProviderIds", {})
-        tvdb = providers.get("Tvdb")
-        played = item.get("UserData", {}).get("Played", False)
-        if tvdb and str(tvdb) in sonarr_watched_tvdb and not played:
-            to_mark.append((item["Id"], item["Name"]))
-
-    if not to_mark:
-        logger.info("All Jellyfin series already synced, nothing to mark")
-        return
-
-    for item_id, name in to_mark:
-        if dry_run:
-            logger.info("[DRY-RUN] Would mark '{}' as watched in Jellyfin", name)
+    for external_id, arr_item in arr_items.items():
+        jf_item = jellyfin_items.get(external_id)
+        if not jf_item:
             continue
 
-        mark_url = (
-            f"{CONFIG['jellyfin_url']}/Users/{jellyfin_user_id}/PlayedItems/{item_id}"
-            f"?api_key={CONFIG['jellyfin_api_key']}"
-        )
-        result = api_request(mark_url, method="POST", emby_token=CONFIG["jellyfin_api_key"])
-        if result is None:
-            logger.error("Failed to mark series '{}' as watched in Jellyfin", name)
+        if watched_tag_id in arr_item.tags and not jf_item.played:
+            to_mark.append(jf_item)
+            logger.info("[{}] Will mark watched in Jellyfin: {}", phase, jf_item.title)
+
+    if to_mark:
+        mark_jellyfin_played(user_id, to_mark, dry_run)
+        logger.info("[{}] Marked {} {} items as watched in Jellyfin", phase, len(to_mark), spec.kind)
+    else:
+        logger.info("[{}] No {} items needed marking in Jellyfin", phase, spec.kind)
+
+
+def sync_media_type(
+    spec: SyncSpec,
+    user_id: str,
+    dry_run: bool,
+    skip_move: bool,
+    skip_refresh: bool,
+) -> None:
+    logger.info("{}", "-" * 60)
+    logger.info("Processing {} via {}", spec.kind, spec.arr_name)
+    logger.info("{}", "-" * 60)
+
+    watched_tag_id = get_arr_tag_id(spec.arr_url, spec.arr_api_key, spec.watched_tag_name)
+    if watched_tag_id is None:
+        logger.error("Could not resolve {} tag '{}'", spec.arr_name, spec.watched_tag_name)
+        return
+
+    jellyfin_items = get_jellyfin_items(user_id, spec.kind)
+    arr_items = get_arr_items(spec)
+
+    logger.info("Fetched {} Jellyfin {} items", len(jellyfin_items), spec.kind)
+    logger.info("Fetched {} {} items", len(arr_items), spec.arr_name)
+
+    # 1) Jellyfin played -> Arr watched tag
+    to_tag: list[int] = []
+    for external_id, jf_item in jellyfin_items.items():
+        arr_item = arr_items.get(external_id)
+        if not arr_item:
+            continue
+
+        if jf_item.played and watched_tag_id not in arr_item.tags:
+            to_tag.append(arr_item.arr_id)
+            logger.info("Will tag in {}: {}", spec.arr_name, arr_item.title)
+
+    if to_tag:
+        if apply_watched_tag_to_arr(spec, to_tag, watched_tag_id, dry_run):
+            logger.info("Tagged {} {} items in {}", len(to_tag), spec.kind, spec.arr_name)
+            tagged_ids = set(to_tag)
+            for arr_item in arr_items.values():
+                if arr_item.arr_id in tagged_ids and watched_tag_id not in arr_item.tags:
+                    arr_item.tags.append(watched_tag_id)
         else:
-            logger.info("Marked series '{}' as watched in Jellyfin", name)
+            logger.error("Failed tagging watched {} in {}", spec.kind, spec.arr_name)
+    else:
+        logger.info("No {} items needed tagging in {}", spec.kind, spec.arr_name)
+
+    # 2) Arr watched tag -> Jellyfin played
+    sync_arr_to_jellyfin_played(
+        user_id=user_id,
+        jellyfin_items=jellyfin_items,
+        arr_items=arr_items,
+        watched_tag_id=watched_tag_id,
+        dry_run=dry_run,
+        spec=spec,
+        phase="pre-move",
+    )
+
+    # 3) Move watched items in Arr
+    moved_any = False
+    if skip_move:
+        logger.info("Skipping move for {} (--skip-move)", spec.kind)
+    else:
+        to_move: list[ArrItem] = []
+        for arr_item in arr_items.values():
+            if watched_tag_id in arr_item.tags and arr_item.path.startswith(spec.new_root):
+                to_move.append(arr_item)
+                logger.info("Will move: {}", arr_item.title)
+
+        if to_move:
+            if move_arr_items(spec, [x.arr_id for x in to_move], dry_run):
+                moved_any = True
+                logger.info("Moved {} {} items in {}", len(to_move), spec.kind, spec.arr_name)
+                if not dry_run:
+                    logger.info("Waiting {}s for {} to finish moving...", CONFIG["move_wait_seconds"], spec.arr_name)
+                    time.sleep(CONFIG["move_wait_seconds"])
+            else:
+                logger.error("Failed moving {} items in {}", spec.kind, spec.arr_name)
+        else:
+            logger.info("No {} items needed moving", spec.kind)
+
+    # 4) Refresh Jellyfin
+    if skip_refresh:
+        logger.info("Skipping Jellyfin refresh (--skip-refresh)")
+    elif moved_any or dry_run:
+        trigger_jellyfin_refresh(dry_run=dry_run)
+    else:
+        logger.info("Skipping Jellyfin refresh because no {} items moved", spec.kind)
+
+    # 5) Re-fetch Jellyfin after refresh and repair watched state
+    jellyfin_items_after = get_jellyfin_items(user_id, spec.kind)
+    if not jellyfin_items_after:
+        logger.warning("Could not re-fetch Jellyfin {} items after refresh", spec.kind)
+        return
+
+    sync_arr_to_jellyfin_played(
+        user_id=user_id,
+        jellyfin_items=jellyfin_items_after,
+        arr_items=arr_items,
+        watched_tag_id=watched_tag_id,
+        dry_run=dry_run,
+        spec=spec,
+        phase="post-refresh-repair",
+    )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Sync watched status between Jellyfin, Radarr, and Sonarr")
-    parser.add_argument("--dry-run", action="store_true", help="Show what would happen without making changes")
-    parser.add_argument("--skip-move", action="store_true", help="Skip moving files (only tag)")
-    parser.add_argument("--skip-scan", action="store_true", help="Skip Jellyfin library scan")
+    parser = argparse.ArgumentParser(description="Sync watched state between Jellyfin, Radarr, and Sonarr")
+    parser.add_argument("--dry-run", action="store_true", help="Show actions without changing anything")
+    parser.add_argument("--skip-move", action="store_true", help="Skip Arr file moves")
+    parser.add_argument("--skip-refresh", action="store_true", help="Skip Jellyfin refresh")
     args = parser.parse_args()
 
     logger.info("{}", "=" * 60)
-    logger.info("Media Status Sync: Jellyfin <-> Radarr / Sonarr if configured)")
+    logger.info("Media Status Sync")
     logger.info("{}", "=" * 60)
 
-    global radarr_movies_cache, sonarr_series_cache
-
-    jellyfin_user_id = get_jellyfin_user_id()
-    if not jellyfin_user_id:
+    user_id = get_jellyfin_user_id()
+    if not user_id:
         logger.error("Could not resolve Jellyfin user '{}'", CONFIG["jellyfin_username"])
         sys.exit(1)
 
-    radarr_watched_tag_id = get_arr_tag_id(
-        CONFIG["radarr_url"], CONFIG["radarr_api_key"], CONFIG["radarr_watched_tag"]
+    movie_spec = SyncSpec(
+        kind="movie",
+        arr_name="Radarr",
+        arr_url=CONFIG["radarr_url"],
+        arr_api_key=CONFIG["radarr_api_key"],
+        watched_tag_name=CONFIG["radarr_watched_tag"],
+        new_root=CONFIG["movie_new_root_folder"],
+        watched_root=CONFIG["movie_watched_root_folder"],
     )
-    if radarr_watched_tag_id is None:
-        logger.error("Could not resolve Radarr tag '{}'", CONFIG["radarr_watched_tag"])
-        sys.exit(1)
 
-    sonarr_watched_tag_id: int | None = None
+    sync_media_type(
+        spec=movie_spec,
+        user_id=user_id,
+        dry_run=args.dry_run,
+        skip_move=args.skip_move,
+        skip_refresh=args.skip_refresh,
+    )
+
     if CONFIG["sonarr_url"] and CONFIG["sonarr_api_key"]:
-        sonarr_watched_tag_id = get_arr_tag_id(
-            CONFIG["sonarr_url"], CONFIG["sonarr_api_key"], CONFIG["sonarr_watched_tag"]
+        series_spec = SyncSpec(
+            kind="series",
+            arr_name="Sonarr",
+            arr_url=CONFIG["sonarr_url"],
+            arr_api_key=CONFIG["sonarr_api_key"],
+            watched_tag_name=CONFIG["sonarr_watched_tag"],
+            new_root=CONFIG["series_new_root_folder"],
+            watched_root=CONFIG["series_watched_root_folder"],
         )
-        if sonarr_watched_tag_id is None:
-            logger.error("Could not resolve Sonarr tag '{}'", CONFIG["sonarr_watched_tag"])
-            sys.exit(1)
 
-    logger.info("[1/7] Fetching watched movies from Jellyfin...")
-    jf_watched = get_jellyfin_watched_movies(jellyfin_user_id)
-    if jf_watched is None:
-        logger.error("Failed to fetch watched movies from Jellyfin")
-        sys.exit(1)
-    logger.info("Found {} watched movies in Jellyfin", len(jf_watched))
-
-    logger.info("[2/7] Fetching movies from Radarr...")
-    radarr_movies_cache = get_radarr_movies()
-    if radarr_movies_cache is None:
-        logger.error("Failed to fetch movies from Radarr")
-        sys.exit(1)
-    logger.info("Found {} movies in Radarr", len(radarr_movies_cache))
-
-    logger.info("[3/7] Syncing watched tag to Radarr...")
-    to_tag: list[int] = []
-    for tmdb in jf_watched:
-        if tmdb in radarr_movies_cache:
-            movie = radarr_movies_cache[tmdb]
-            if radarr_watched_tag_id not in movie["tags"]:
-                to_tag.append(movie["id"])
-                logger.info("Tag needed: {}", movie["title"])
-
-    if to_tag:
-        if tag_radarr_movies(to_tag, radarr_watched_tag_id, dry_run=args.dry_run):
-            logger.info("Tagged {} movies as watched in Radarr", len(to_tag))
+        sync_media_type(
+            spec=series_spec,
+            user_id=user_id,
+            dry_run=args.dry_run,
+            skip_move=args.skip_move,
+            skip_refresh=args.skip_refresh,
+        )
     else:
-        logger.info("All watched movies already tagged in Radarr")
-
-    logger.info("[4/7] Checking Radarr watched -> Jellyfin...")
-    radarr_watched_tmdb = {
-        tmdb for tmdb, movie in radarr_movies_cache.items() if radarr_watched_tag_id in movie["tags"]
-    }
-    mark_jellyfin_movies_unwatched_to_watched(radarr_watched_tmdb, jellyfin_user_id, dry_run=args.dry_run)
-
-    logger.info("[4/9] Sonarr sync...")
-    if CONFIG["sonarr_url"] and CONFIG["sonarr_api_key"] and sonarr_watched_tag_id is not None:
-        logger.info("[4a/9] Fetching watched series from Jellyfin...")
-        jf_watched_series = get_jellyfin_watched_series(jellyfin_user_id)
-        if jf_watched_series is None:
-            logger.error("Failed to fetch watched series from Jellyfin")
-            jf_watched_series = {}
-        else:
-            logger.info("Found {} watched series in Jellyfin", len(jf_watched_series))
-
-        logger.info("[4b/9] Fetching series from Sonarr...")
-        sonarr_series_cache = get_sonarr_series()
-        if sonarr_series_cache is None:
-            logger.error("Failed to fetch series from Sonarr")
-            sonarr_series_cache = {}
-        else:
-            logger.info("Found {} series in Sonarr", len(sonarr_series_cache))
-
-            logger.info("[4c/9] Syncing watched tag to Sonarr...")
-            to_tag_series: list[int] = []
-            for tvdb in jf_watched_series:
-                if tvdb in sonarr_series_cache:
-                    series = sonarr_series_cache[tvdb]
-                    if sonarr_watched_tag_id not in series["tags"]:
-                        to_tag_series.append(series["id"])
-                        logger.info("Tag needed: {}", series["title"])
-
-            if to_tag_series:
-                if tag_sonarr_series(to_tag_series, sonarr_watched_tag_id, dry_run=args.dry_run):
-                    logger.info("Tagged {} series as watched in Sonarr", len(to_tag_series))
-            else:
-                logger.info("All watched series already tagged in Sonarr")
-
-            logger.info("[4d/9] Checking Sonarr watched -> Jellyfin series...")
-            sonarr_watched_tvdb = {
-                tvdb for tvdb, series in sonarr_series_cache.items()
-                if sonarr_watched_tag_id in series["tags"]
-            }
-            logger.info("Found {} Sonarr series tagged as watched", len(sonarr_watched_tvdb))
-            mark_jellyfin_series_unwatched_to_watched(
-                sonarr_watched_tvdb, jellyfin_user_id, dry_run=args.dry_run
-            )
-    else:
-        logger.info("Skipped, Sonarr sync is not configured")
-        sonarr_watched_tvdb = set()
-
-    logger.info("[5/9] Moving watched movies to watched folder...")
-    if args.skip_move:
-        logger.info("Skipped (--skip-move)")
-    else:
-        to_move: list[int] = []
-        for tmdb in radarr_watched_tmdb:
-            if tmdb in radarr_movies_cache:
-                movie = radarr_movies_cache[tmdb]
-                if movie["path"].startswith(CONFIG["movie_new_root_folder"]):
-                    to_move.append(movie["id"])
-                    logger.info("Move needed: {}", movie["title"])
-
-        if to_move:
-            moved = move_radarr_movies(to_move, dry_run=args.dry_run)
-            if moved:
-                logger.info("Moved {} movies to {}", len(moved), CONFIG["movie_watched_root_folder"])
-                logger.info("Waiting {}s for Radarr to process moves...", CONFIG["move_wait_seconds"])
-                time.sleep(CONFIG["move_wait_seconds"])
-
-                logger.info("[5b/9] Updating Jellyfin paths for moved movies...")
-                update_jellyfin_movies_paths(moved, dry_run=args.dry_run)
-        else:
-            logger.info("All watched movies already in watched folder")
-
-    logger.info("[6/9] Moving watched series to watched folder...")
-    if args.skip_move:
-        logger.info("Skipped (--skip-move)")
-    elif not (CONFIG["sonarr_url"] and CONFIG["sonarr_api_key"]):
-        logger.info("Skipped, Sonarr sync is not configured")
-    else:
-        to_move_ids: list[int] = []
-        to_move_tvdb: list[str] = []
-        for tvdb in sonarr_watched_tvdb:
-            if tvdb in sonarr_series_cache:
-                series = sonarr_series_cache[tvdb]
-                if series["path"].startswith(CONFIG["series_new_root_folder"]):
-                    to_move_ids.append(series["id"])
-                    to_move_tvdb.append(tvdb)
-                    logger.info("Move needed: {}", series["title"])
-
-        if to_move_ids:
-            moved_series = move_sonarr_series(to_move_ids, dry_run=args.dry_run)
-            if moved_series:
-                logger.info("Moved {} series to {}", len(moved_series), CONFIG["series_watched_root_folder"])
-                logger.info("Waiting {}s for Sonarr to process moves...", CONFIG["move_wait_seconds"])
-                time.sleep(CONFIG["move_wait_seconds"])
-
-                logger.info("[6b/9] Updating Jellyfin paths for moved series...")
-                update_jellyfin_series_paths(to_move_tvdb, dry_run=args.dry_run)
-        else:
-            logger.info("All watched series already in watched folder")
-
-    logger.info("[7/9] Triggering Jellyfin path-only refresh...")
-    if args.skip_move:
-        logger.info("Skipped (--skip-move)")
-    else:
-        trigger_path_refresh(dry_run=args.dry_run)
-
-    logger.info("[8/9] Triggering Jellyfin library scan...")
-    if args.skip_scan:
-        logger.info("Skipped (--skip-scan). Relying on Radarr -> Jellyfin sync for played status.")
-    elif args.dry_run:
-        logger.info("[DRY-RUN] Would skip Jellyfin library scan (due to potential unmark issue).")
-    else:
-        logger.info("Skipping Jellyfin library scan (due to potential unmark issue).")
-
-    logger.info("[9/9] Final verification: Jellyfin watched -> Radarr tag...")
-    mark_jellyfin_movies_unwatched_to_watched(set(jf_watched.keys()), jellyfin_user_id, dry_run=args.dry_run)
+        logger.info("Sonarr not configured, skipping series sync")
 
     logger.info("{}", "=" * 60)
     logger.info("Done")
