@@ -1,4 +1,4 @@
-# 🎬 Jellyfin Media Status Sync
+# 🎬 Jellyfin Media Status Sync (StreamOrganizer)
 
 Synchronize watched status between Jellyfin, Radarr, and Sonarr, and automatically organize media by moving watched content from a `New` folder to a `Watched` folder.
 
